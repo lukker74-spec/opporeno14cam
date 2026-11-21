@@ -18,10 +18,9 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Download Real-ESRGAN / SwinIR Neural SR Model (.tflite)
+      - name: Download Real-ESRGAN / ESRGAN Neural SR Model (.tflite)
         run: |
           mkdir -p app/src/main/assets tmp_model
-          # Scarica modello neurale Super-Resolution per foto reali
           if curl -fL "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/main/Real-ESRGAN-x4plus.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
             echo "Scaricato Real-ESRGAN-x4plus.tflite"
           elif curl -fL "https://huggingface.co/qualcomm/QuickSRNetMedium/resolve/main/QuickSRNetMedium.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
@@ -50,5 +49,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reno14-FreshCam-ProSR-APK
+          name: Reno14-FreshCam-v6-NeuralZoom-APK
           path: app/build/outputs/apk/debug/app-debug.apk
