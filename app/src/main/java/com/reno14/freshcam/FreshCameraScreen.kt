@@ -267,7 +267,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
-                // Tasto ON / OFF Rete Neurale Super-Resolution (ESRGAN)
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))

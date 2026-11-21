@@ -105,14 +105,9 @@ class NeuralSuperResEngine(private val context: Context) {
         }
     }
 
-    /**
-     * Esegue inferenza neurale reale ESRGAN (50x50 -> 200x200, fattore 4x)
-     * su una griglia centrale 4x4 di tasselli ad alta definizione e ricompone il risultato
-     * sull'immagine salvata, rendendo visibile la ricostruzione generativa della rete neurale.
-     */
     private fun runEsrganTiledInference(tflite: Interpreter, source: Bitmap): Bitmap {
-        val inShape = tflite.getInputTensor(0).shape() // [1, 50, 50, 3]
-        val outShape = tflite.getOutputTensor(0).shape() // [1, 200, 200, 3]
+        val inShape = tflite.getInputTensor(0).shape()
+        val outShape = tflite.getOutputTensor(0).shape()
 
         val inH = if (inShape.size == 4 && inShape[1] > 0) inShape[1] else 50
         val inW = if (inShape.size == 4 && inShape[2] > 0) inShape[2] else 50
@@ -123,7 +118,6 @@ class NeuralSuperResEngine(private val context: Context) {
         val canvas = Canvas(resultBitmap)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
-        // Elabora una regione centrale pari al 70% dell'inquadratura suddivisa in tasselli (4x4)
         val gridCols = 4
         val gridRows = 4
         val regionW = (source.width * 0.70f).toInt().coerceAtLeast(inW * gridCols)
