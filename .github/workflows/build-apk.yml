@@ -18,17 +18,24 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Download ESRGAN Neural Model (.tflite)
+      - name: Download Real-ESRGAN / SwinIR Neural SR Model (.tflite)
         run: |
           mkdir -p app/src/main/assets tmp_model
-          curl -fL "https://www.kaggle.com/api/v1/models/kaggle/esrgan-tf2/tfLite/esrgan-tf2/1/download" -o tmp_model/model.tar.gz
-          tar -xzf tmp_model/model.tar.gz -C tmp_model
-          FOUND_TFLITE=$(find tmp_model -name "*.tflite" | head -n 1)
-          if [ -z "$FOUND_TFLITE" ] || [ ! -s "$FOUND_TFLITE" ]; then
-            echo "ERRORE: nessun file .tflite valido trovato nell'archivio"
-            exit 1
+          # Scarica modello neurale Super-Resolution per foto reali
+          if curl -fL "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/main/Real-ESRGAN-x4plus.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
+            echo "Scaricato Real-ESRGAN-x4plus.tflite"
+          elif curl -fL "https://huggingface.co/qualcomm/QuickSRNetMedium/resolve/main/QuickSRNetMedium.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
+            echo "Scaricato QuickSRNetMedium.tflite"
+          else
+            curl -fL "https://www.kaggle.com/api/v1/models/kaggle/esrgan-tf2/tfLite/esrgan-tf2/1/download" -o tmp_model/model.tar.gz
+            tar -xzf tmp_model/model.tar.gz -C tmp_model
+            FOUND_TFLITE=$(find tmp_model -name "*.tflite" | head -n 1)
+            if [ -z "$FOUND_TFLITE" ] || [ ! -s "$FOUND_TFLITE" ]; then
+              echo "ERRORE: nessun file .tflite valido trovato"
+              exit 1
+            fi
+            cp "$FOUND_TFLITE" app/src/main/assets/superres.tflite
           fi
-          cp "$FOUND_TFLITE" app/src/main/assets/esrgan.tflite
           rm -rf tmp_model
           ls -lh app/src/main/assets/
 
@@ -43,5 +50,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reno14-FreshCam-Neural-APK
+          name: Reno14-FreshCam-ProSR-APK
           path: app/build/outputs/apk/debug/app-debug.apk
