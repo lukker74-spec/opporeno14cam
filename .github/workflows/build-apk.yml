@@ -1,4 +1,4 @@
-name: Build Reno14 FreshCam v7 Burst+Cloud APK
+name: Build Reno14 FreshCam v7.1 SafeMemory APK
 
 on:
   push:
@@ -49,5 +49,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reno14-FreshCam-v7-BurstCloud-APK
+          name: Reno14-FreshCam-v7-1-SafeBurst-APK
           path: app/build/outputs/apk/debug/app-debug.apk
