@@ -1,4 +1,4 @@
-name: Build Reno14 FreshCam v7.1 SafeMemory APK
+name: Build Reno14 FreshCam v8 MediaTek+Cloud APK
 
 on:
   push:
@@ -18,13 +18,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Download Best Local Neural Model (SwinIR / QuickSRNet / ESRGAN)
+      - name: Download Fast Mobile Super-Resolution TFLite Model (MediaTek NNAPI Ready)
         run: |
           mkdir -p app/src/main/assets tmp_model
-          if curl -fL "https://huggingface.co/qualcomm/SwinIR/resolve/main/SwinIR.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
-            echo "Scaricato SwinIR.tflite"
-          elif curl -fL "https://huggingface.co/qualcomm/QuickSRNetLarge/resolve/main/QuickSRNetLarge.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
-            echo "Scaricato QuickSRNetLarge.tflite"
+          if curl -fL "https://huggingface.co/qualcomm/QuickSRNetSmall/resolve/main/QuickSRNetSmall.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
+            echo "Scaricato QuickSRNetSmall.tflite (veloce per NNAPI/MediaTek)"
+          elif curl -fL "https://huggingface.co/qualcomm/XLSR/resolve/main/XLSR.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
+            echo "Scaricato XLSR.tflite"
           else
             curl -fL "https://www.kaggle.com/api/v1/models/kaggle/esrgan-tf2/tfLite/esrgan-tf2/1/download" -o tmp_model/model.tar.gz
             tar -xzf tmp_model/model.tar.gz -C tmp_model
@@ -49,5 +49,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reno14-FreshCam-v7-1-SafeBurst-APK
+          name: Reno14-FreshCam-v8-MediaTekCloud-APK
           path: app/build/outputs/apk/debug/app-debug.apk
