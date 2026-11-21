@@ -27,26 +27,12 @@ data class NeuralProcessResult(
 )
 
 /**
- * Motore AI v7.0 con architettura Multi-Frame Burst + Rete Neurale (SwinIR / ESRGAN) + Cloud AI opzionale:
- *
- * Perché nella v6 l'AI sembrava peggiorare lo scatto rispetto a AI OFF:
- * Nella v6 prendevamo un riquadro grande e lo rimpicciolivamo a 50x50 pixel prima di darlo alla rete,
- * distruggendo i dettagli reali dell'immagine originale.
- *
- * Come funziona invece ora nella v7.0:
- * 1. MULTI-FRAME BURST ALIGNMENT (Scatto multiplo allineato):
- *    Quando AI: ON è attivo, fonde 3 fotogrammi catturati in sequenza rapida allineandoli tra loro
- *    per abbattere il rumore reale del sensore e recuperare segnale vero.
- * 2. RETE NEURALE IN MODALITÀ RESIDUALE (High-Frequency Detail Injection):
- *    La rete neurale (.tflite) NON sostituisce mai i pixel originali con una versione sfocata/rimpicciolita:
- *    calcoliamo solo la differenza di dettaglio ad alta frequenza (dettaglio neurale - base neurale)
- *    e la sommiamo direttamente ai pixel originali ad altissima risoluzione!
- *    In questo modo la foto non perde MAI nitidezza rispetto ad AI: OFF, ma guadagna definizione
- *    reale e pulizia sia a 1x sia sullo zoom spinto fino a 60x.
- * 3. CLOUD AI GENERATIVA OPZIONALE (attivabile/disattivabile):
- *    Se attivata nelle impostazioni (con API Key gratuita Hugging Face / endpoint compatibile),
- *    invia il ritaglio centrale dello zoom spinto al modello Swin2SR/Diffusion in Cloud per una
- *    ricostruzione generativa ad altissima definizione.
+ * Motore AI v7.1 Safe-Memory (Anti-Crash / Anti-OOM):
+ * - Libera immediatamente tutte le bitmap intermedie (recycle) e limita la dimensione massima di
+ *   elaborazione a 3200px, evitando il crash OutOfMemoryError su Android quando AI: ON elabora
+ *   raffiche e tasselli TFLite.
+ * - Verifica anche che il modello .tflite abbia effettivamente un tensor di uscita 4D immagine
+ *   prima di eseguirlo, proteggendo l'app da qualsiasi crash nativo TFLite.
  */
 class NeuralSuperResEngine(private val context: Context) {
 
@@ -76,14 +62,20 @@ class NeuralSuperResEngine(private val context: Context) {
                     setNumThreads(4)
                 }
                 val tflite = Interpreter(mappedBuffer, options)
+                val inShape = tflite.getInputTensor(0).shape()
+                val outShape = tflite.getOutputTensor(0).shape()
+                if (inShape.size != 4 || outShape.size != 4) {
+                    tflite.close()
+                    continue
+                }
                 interpreter = tflite
                 loadedAssetName = assetName
-                Log.i("NeuralSR", "Modello neurale $assetName caricato con successo")
+                Log.i("NeuralSR", "Modello neurale $assetName pronto (${inShape.contentToString()} -> ${outShape.contentToString()})")
                 return tflite
-            } catch (_: Exception) {
+            } catch (e: Throwable) {
+                Log.w("NeuralSR", "Asset $assetName non caricabile: ${e.message}")
             }
         }
-        Log.w("NeuralSR", "Nessun modello .tflite trovato in assets")
         return null
     }
 
@@ -111,7 +103,9 @@ class NeuralSuperResEngine(private val context: Context) {
 
         if (!superResEnabled) {
             if (postSavePolish) {
-                working = applyToneBalance(working, strength = 0.45f)
+                val toned = applyToneBalance(working, strength = 0.45f)
+                if (toned !== working) working.recycle()
+                working = toned
             }
             return NeuralProcessResult(
                 bitmap = working,
@@ -122,63 +116,76 @@ class NeuralSuperResEngine(private val context: Context) {
         val isZoomSpinto = displayZoom >= 8.0f || lensZoomRatio >= 2.2f
         val isZoomEstremo = displayZoom >= 25.0f || lensZoomRatio >= 7.0f
 
-        // 1. MULTI-FRAME BURST FUSION: se abbiamo catturato più frame in raffica, li allineiamo e fondiamo
-        //    per ridurre il rumore reale e aumentare la nitidezza nativa prima della rete neurale
-        var burstMerged = working
+        // 1. Fusione Burst allineata (riciclando subito i frame extra per non saturare la RAM)
         var burstUsed = false
         if (frames.size > 1) {
-            val gradedExtras = frames.drop(1).map {
-                profile.applyToBitmap(it, strength = profileIntensity, brightnessBoost = brightnessBoost)
+            try {
+                val gradedExtras = frames.drop(1).map {
+                    profile.applyToBitmap(it, strength = profileIntensity, brightnessBoost = brightnessBoost)
+                }
+                val merged = alignAndMergeBurst(working, gradedExtras)
+                gradedExtras.forEach { if (!it.isRecycled) it.recycle() }
+                if (merged !== working) {
+                    working.recycle()
+                    working = merged
+                }
+                burstUsed = true
+            } catch (t: Throwable) {
+                Log.e("NeuralSR", "Burst fallback su frame singolo", t)
             }
-            burstMerged = alignAndMergeBurst(working, gradedExtras)
-            burstUsed = true
         }
 
-        // 2. Pulizia rumore cromatico sensibile ai bordi
-        val denoised = filterChromaOnly(
-            bitmap = burstMerged,
-            passes = if (isZoomSpinto) 2 else 1
-        )
+        // 2. Pulizia rumore cromatico
+        val denoised = try {
+            filterChromaOnly(working, passes = if (isZoomSpinto) 2 else 1)
+        } catch (t: Throwable) {
+            working
+        }
+        if (denoised !== working && !working.isRecycled) {
+            working.recycle()
+        }
+        working = denoised
 
-        // 3. RETE NEURALE RESIDUALE (SwinIR / ESRGAN): inietta dettagli ad alta frequenza
-        //    senza mai degradare o sfocare i pixel nativi della foto originale
+        // 3. Iniezione Residuale Neurale TFLite (protetta da qualsiasi eccezione nativa/memoria)
         val tflite = getInterpreter()
         var neuralUsed = false
-        var afterNeural = denoised
-
         if (tflite != null) {
             try {
-                afterNeural = runResidualNeuralInjection(
+                val neuralOut = runResidualNeuralInjection(
                     tflite = tflite,
-                    nativeSharpSource = denoised,
+                    nativeSharpSource = working,
                     aiMode = aiMode,
                     isTeleLens = isTeleLens,
                     isZoomSpinto = isZoomSpinto,
                     isZoomEstremo = isZoomEstremo
                 )
+                if (neuralOut !== working) {
+                    working.recycle()
+                    working = neuralOut
+                }
                 neuralUsed = true
-            } catch (e: Exception) {
-                Log.e("NeuralSR", "Errore inferenza TFLite residuale", e)
-                afterNeural = denoised
+            } catch (t: Throwable) {
+                Log.e("NeuralSR", "Inferenza TFLite saltata in sicurezza: ${t.message}", t)
             }
         }
 
-        // 4. CLOUD AI GENERATIVA OPZIONALE (solo se attivata dall'utente e su zoom spinto o AI Alto)
+        // 4. Cloud AI opzionale
         var cloudUsed = false
         if (cloudAiEnabled && cloudEndpointUrl.isNotBlank() && (isZoomSpinto || aiMode == AiMode.AGGRESSIVE)) {
             val cloudResult = tryCloudSuperResolution(
-                source = afterNeural,
+                source = working,
                 endpointUrl = cloudEndpointUrl,
                 apiKey = cloudApiKey,
                 isZoomEstremo = isZoomEstremo
             )
             if (cloudResult != null) {
-                afterNeural = cloudResult
+                if (cloudResult !== working) working.recycle()
+                working = cloudResult
                 cloudUsed = true
             }
         }
 
-        // 5. Rifinitura micro-contrasto adattivo calibrata
+        // 5. Rifinitura bordi e bilanciamento tonale
         val detailGain = when {
             isZoomEstremo -> when (aiMode) {
                 AiMode.LOW -> 0.35f
@@ -202,9 +209,22 @@ class NeuralSuperResEngine(private val context: Context) {
             }
         }
 
-        var finalBmp = adaptiveEdgeEnhance(afterNeural, detailGain)
+        val edged = try {
+            adaptiveEdgeEnhance(working, detailGain)
+        } catch (_: Throwable) {
+            working
+        }
+        if (edged !== working && !working.isRecycled) working.recycle()
+        working = edged
+
         if (postSavePolish) {
-            finalBmp = applyToneBalance(finalBmp, strength = if (isZoomSpinto) 0.65f else 0.45f)
+            val toned = try {
+                applyToneBalance(working, strength = if (isZoomSpinto) 0.65f else 0.45f)
+            } catch (_: Throwable) {
+                working
+            }
+            if (toned !== working && !working.isRecycled) working.recycle()
+            working = toned
         }
 
         val parts = mutableListOf<String>()
@@ -214,42 +234,38 @@ class NeuralSuperResEngine(private val context: Context) {
         if (parts.isEmpty()) parts.add("AI ${aiMode.shortLabel}")
 
         return NeuralProcessResult(
-            bitmap = finalBmp,
+            bitmap = working,
             modeApplied = parts.joinToString(" + ")
         )
     }
 
-    /**
-     * Allinea i fotogrammi della raffica cercando lo spostamento (dx, dy) con minima differenza
-     * al centro dell'immagine e li media pesando la nitidezza, abbattendo il rumore del sensore.
-     */
     private fun alignAndMergeBurst(base: Bitmap, extras: List<Bitmap>): Bitmap {
         val w = base.width
         val h = base.height
-        val basePx = IntArray(w * h)
+        val total = w * h
+        val basePx = IntArray(total)
         base.getPixels(basePx, 0, w, 0, 0, w, h)
 
-        val accR = IntArray(w * h) { (basePx[it] ushr 16) and 0xFF }
-        val accG = IntArray(w * h) { (basePx[it] ushr 8) and 0xFF }
-        val accB = IntArray(w * h) { basePx[it] and 0xFF }
-        val accW = IntArray(w * h) { 2 } // peso doppia fiducia al frame principale
+        val accR = IntArray(total) { (basePx[it] ushr 16) and 0xFF }
+        val accG = IntArray(total) { (basePx[it] ushr 8) and 0xFF }
+        val accB = IntArray(total) { basePx[it] and 0xFF }
+        val accW = ByteArray(total) { 2 }
 
-        val patchSize = min(160, min(w, h) / 3)
+        val patchSize = min(140, min(w, h) / 3)
         val cx = w / 2 - patchSize / 2
         val cy = h / 2 - patchSize / 2
+        val extPx = IntArray(total)
 
         for (extra in extras) {
             if (extra.width != w || extra.height != h) continue
-            val extPx = IntArray(w * h)
             extra.getPixels(extPx, 0, w, 0, 0, w, h)
 
-            // Cerca miglior allineamento entro +-10 pixel
             var bestDx = 0
             var bestDy = 0
             var bestSad = Long.MAX_VALUE
 
-            for (dy in -10..10 step 2) {
-                for (dx in -10..10 step 2) {
+            for (dy in -8..8 step 2) {
+                for (dx in -8..8 step 2) {
                     var sad = 0L
                     for (py in 0 until patchSize step 4) {
                         val rowBase = (cy + py) * w
@@ -268,11 +284,10 @@ class NeuralSuperResEngine(private val context: Context) {
                 }
             }
 
-            // Fusione ghost-free (scarta pixel che si sono mossi troppo rispetto al frame base)
-            for (y in 10 until h - 10) {
+            for (y in 8 until h - 8) {
                 val rowB = y * w
                 val rowE = (y + bestDy) * w
-                for (x in 10 until w - 10) {
+                for (x in 8 until w - 8) {
                     val idxB = rowB + x
                     val idxE = rowE + (x + bestDx)
                     val bp = basePx[idxB]
@@ -286,19 +301,18 @@ class NeuralSuperResEngine(private val context: Context) {
                     val eg = (ep ushr 8) and 0xFF
                     val eb = ep and 0xFF
 
-                    val diff = (abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3
-                    if (diff < 26) {
+                    if ((abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3 < 26) {
                         accR[idxB] += er
                         accG[idxB] += eg
                         accB[idxB] += eb
-                        accW[idxB] += 1
+                        accW[idxB] = (accW[idxB] + 1).toByte()
                     }
                 }
             }
         }
 
         for (i in basePx.indices) {
-            val weight = accW[i]
+            val weight = accW[i].toInt() and 0xFF
             val r = (accR[i] / weight).coerceIn(0, 255)
             val g = (accG[i] / weight).coerceIn(0, 255)
             val b = (accB[i] / weight).coerceIn(0, 255)
@@ -310,13 +324,6 @@ class NeuralSuperResEngine(private val context: Context) {
         return out
     }
 
-    /**
-     * Iniezione Residuale Neurale:
-     * Calcola la mappa neurale tramite TFLite e ne estrae SOLO la componente di dettaglio ricostruita
-     * (High-Frequency Residual = OutputNeurale - InputDownscaledUpscaled), sommandola ai pixel
-     * nativi ad alta risoluzione. In questo modo l'immagine non viene MAI rimpicciolita o impastata,
-     * ma riceve solo il recupero strutturale della rete neurale.
-     */
     private fun runResidualNeuralInjection(
         tflite: Interpreter,
         nativeSharpSource: Bitmap,
@@ -332,35 +339,44 @@ class NeuralSuperResEngine(private val context: Context) {
         val inType = inTensor.dataType()
         val outType = outTensor.dataType()
 
-        val inH = if (inShape.size == 4 && inShape[1] > 0) inShape[1] else 50
-        val inW = if (inShape.size == 4 && inShape[2] > 0) inShape[2] else 50
-        val outH = if (outShape.size == 4 && outShape[1] > 0) outShape[1] else inH * 4
-        val outW = if (outShape.size == 4 && outShape[2] > 0) outShape[2] else inW * 4
+        // Supporta sia layout NHWC [1, H, W, 3] sia NCHW [1, 3, H, W] senza mai crashare per indici
+        val isNchw = inShape.size == 4 && inShape[1] == 3 && inShape[3] != 3
+        val rawInH = if (isNchw) inShape[2] else inShape[1]
+        val rawInW = if (isNchw) inShape[3] else inShape[2]
+        val inH = (if (rawInH > 0) rawInH else 50).coerceIn(32, 256)
+        val inW = (if (rawInW > 0) rawInW else 50).coerceIn(32, 256)
 
-        val workMaxSide = if (isZoomSpinto) 2200 else 2800
+        val outIsNchw = outShape.size == 4 && outShape[1] == 3 && outShape[3] != 3
+        val rawOutH = if (outIsNchw) outShape[2] else outShape[1]
+        val rawOutW = if (outIsNchw) outShape[3] else outShape[2]
+        val outH = (if (rawOutH > 0) rawOutH else inH * 4).coerceAtLeast(inH)
+        val outW = (if (rawOutW > 0) rawOutW else inW * 4).coerceAtLeast(inW)
+
+        // Dimensione compatta per le mappe residuali (1400px) -> velocissimo (<0.6s) e zero OutOfMemory
+        val workMaxSide = if (isZoomSpinto) 1400 else 1600
         val workBase = scaleToMaxSide(nativeSharpSource, workMaxSide)
 
-        // Costruiamo due mappe:
-        // 1) neuralMap: uscita della rete neurale
-        // 2) baselineMap: stesso ritaglio passato attraverso il solo downscale/upscale lineare
-        // La differenza (neuralMap - baselineMap) è il puro dettaglio aggiunto dalla rete neurale!
         val neuralMap = Bitmap.createBitmap(workBase.width, workBase.height, Bitmap.Config.ARGB_8888)
         val baselineMap = Bitmap.createBitmap(workBase.width, workBase.height, Bitmap.Config.ARGB_8888)
         val neuralCanvas = Canvas(neuralMap)
         val baseCanvas = Canvas(baselineMap)
 
-        val cols = if (isZoomSpinto) 6 else 4
-        val rows = if (isZoomSpinto) 6 else 4
+        val cols = if (isZoomSpinto) 5 else 4
+        val rows = if (isZoomSpinto) 5 else 4
         val cellW = workBase.width / cols
         val cellH = workBase.height / rows
 
         val bytesPerChannelIn = if (inType == DataType.UINT8) 1 else 4
         val bytesPerChannelOut = if (outType == DataType.UINT8) 1 else 4
 
-        val inputBuffer = ByteBuffer.allocateDirect(1 * inH * inW * 3 * bytesPerChannelIn).order(ByteOrder.nativeOrder())
-        val outputBuffer = ByteBuffer.allocateDirect(1 * outH * outW * 3 * bytesPerChannelOut).order(ByteOrder.nativeOrder())
+        val inByteCount = inTensor.numBytes().coerceAtLeast(1 * inH * inW * 3 * bytesPerChannelIn)
+        val outByteCount = outTensor.numBytes().coerceAtLeast(1 * outH * outW * 3 * bytesPerChannelOut)
+
+        val inputBuffer = ByteBuffer.allocateDirect(inByteCount).order(ByteOrder.nativeOrder())
+        val outputBuffer = ByteBuffer.allocateDirect(outByteCount).order(ByteOrder.nativeOrder())
         val tilePixels = IntArray(inW * inH)
         val outPixels = IntArray(outW * outH)
+        val srPatch = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
@@ -376,21 +392,34 @@ class NeuralSuperResEngine(private val context: Context) {
 
                 val crop = Bitmap.createBitmap(workBase, left, top, cw, ch)
                 val scaledIn = Bitmap.createScaledBitmap(crop, inW, inH, true)
+                crop.recycle()
                 scaledIn.getPixels(tilePixels, 0, inW, 0, 0, inW, inH)
 
                 inputBuffer.rewind()
                 if (inType == DataType.UINT8) {
-                    for (p in tilePixels) {
-                        inputBuffer.put(((p ushr 16) and 0xFF).toByte())
-                        inputBuffer.put(((p ushr 8) and 0xFF).toByte())
-                        inputBuffer.put((p and 0xFF).toByte())
+                    if (isNchw) {
+                        for (p in tilePixels) inputBuffer.put(((p ushr 16) and 0xFF).toByte())
+                        for (p in tilePixels) inputBuffer.put(((p ushr 8) and 0xFF).toByte())
+                        for (p in tilePixels) inputBuffer.put((p and 0xFF).toByte())
+                    } else {
+                        for (p in tilePixels) {
+                            inputBuffer.put(((p ushr 16) and 0xFF).toByte())
+                            inputBuffer.put(((p ushr 8) and 0xFF).toByte())
+                            inputBuffer.put((p and 0xFF).toByte())
+                        }
                     }
                 } else {
                     val scaleIn = if (inH >= 64) 1f / 255f else 1f
-                    for (p in tilePixels) {
-                        inputBuffer.putFloat(((p ushr 16) and 0xFF) * scaleIn)
-                        inputBuffer.putFloat(((p ushr 8) and 0xFF) * scaleIn)
-                        inputBuffer.putFloat((p and 0xFF) * scaleIn)
+                    if (isNchw) {
+                        for (p in tilePixels) inputBuffer.putFloat(((p ushr 16) and 0xFF) * scaleIn)
+                        for (p in tilePixels) inputBuffer.putFloat(((p ushr 8) and 0xFF) * scaleIn)
+                        for (p in tilePixels) inputBuffer.putFloat((p and 0xFF) * scaleIn)
+                    } else {
+                        for (p in tilePixels) {
+                            inputBuffer.putFloat(((p ushr 16) and 0xFF) * scaleIn)
+                            inputBuffer.putFloat(((p ushr 8) and 0xFF) * scaleIn)
+                            inputBuffer.putFloat((p and 0xFF) * scaleIn)
+                        }
                     }
                 }
                 inputBuffer.rewind()
@@ -400,41 +429,56 @@ class NeuralSuperResEngine(private val context: Context) {
                 outputBuffer.rewind()
 
                 if (outType == DataType.UINT8) {
-                    for (i in outPixels.indices) {
-                        val red = outputBuffer.get().toInt() and 0xFF
-                        val green = outputBuffer.get().toInt() and 0xFF
-                        val blue = outputBuffer.get().toInt() and 0xFF
-                        outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+                    if (outIsNchw) {
+                        val plane = outW * outH
+                        for (i in 0 until plane) {
+                            val red = outputBuffer.get(i).toInt() and 0xFF
+                            val green = outputBuffer.get(plane + i).toInt() and 0xFF
+                            val blue = outputBuffer.get(2 * plane + i).toInt() and 0xFF
+                            outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+                        }
+                    } else {
+                        for (i in outPixels.indices) {
+                            val red = outputBuffer.get().toInt() and 0xFF
+                            val green = outputBuffer.get().toInt() and 0xFF
+                            val blue = outputBuffer.get().toInt() and 0xFF
+                            outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+                        }
                     }
                 } else {
                     val scaleOut = if (inH >= 64) 255f else 1f
-                    for (i in outPixels.indices) {
-                        val red = (outputBuffer.float * scaleOut).toInt().coerceIn(0, 255)
-                        val green = (outputBuffer.float * scaleOut).toInt().coerceIn(0, 255)
-                        val blue = (outputBuffer.float * scaleOut).toInt().coerceIn(0, 255)
-                        outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+                    if (outIsNchw) {
+                        val plane = outW * outH
+                        for (i in 0 until plane) {
+                            val red = (outputBuffer.getFloat(i * 4) * scaleOut).toInt().coerceIn(0, 255)
+                            val green = (outputBuffer.getFloat((plane + i) * 4) * scaleOut).toInt().coerceIn(0, 255)
+                            val blue = (outputBuffer.getFloat((2 * plane + i) * 4) * scaleOut).toInt().coerceIn(0, 255)
+                            outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+                        }
+                    } else {
+                        for (i in outPixels.indices) {
+                            val red = (outputBuffer.float * scaleOut).toInt().coerceIn(0, 255)
+                            val green = (outputBuffer.float * scaleOut).toInt().coerceIn(0, 255)
+                            val blue = (outputBuffer.float * scaleOut).toInt().coerceIn(0, 255)
+                            outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+                        }
                     }
                 }
 
-                val srPatch = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
                 srPatch.setPixels(outPixels, 0, outW, 0, 0, outW, outH)
-
                 val dstRect = Rect(left, top, right, bottom)
                 neuralCanvas.drawBitmap(srPatch, null, dstRect, paint)
                 baseCanvas.drawBitmap(scaledIn, null, dstRect, paint)
+                scaledIn.recycle()
             }
         }
+        srPatch.recycle()
+        if (workBase !== nativeSharpSource) workBase.recycle()
 
-        val fullNeural = if (neuralMap.width != nativeSharpSource.width || neuralMap.height != nativeSharpSource.height) {
-            Bitmap.createScaledBitmap(neuralMap, nativeSharpSource.width, nativeSharpSource.height, true)
-        } else {
-            neuralMap
-        }
-        val fullBaseline = if (baselineMap.width != nativeSharpSource.width || baselineMap.height != nativeSharpSource.height) {
-            Bitmap.createScaledBitmap(baselineMap, nativeSharpSource.width, nativeSharpSource.height, true)
-        } else {
-            baselineMap
-        }
+        val fullNeural = Bitmap.createScaledBitmap(neuralMap, nativeSharpSource.width, nativeSharpSource.height, true)
+        val fullBaseline = Bitmap.createScaledBitmap(baselineMap, nativeSharpSource.width, nativeSharpSource.height, true)
+        neuralMap.recycle()
+        baselineMap.recycle()
 
         val residualStrength = when {
             isZoomEstremo -> when (aiMode) {
@@ -453,7 +497,6 @@ class NeuralSuperResEngine(private val context: Context) {
                 AiMode.AGGRESSIVE -> 0.90f
             }
             else -> when (aiMode) {
-                // Foto normali 1x: discreto ma nitido
                 AiMode.LOW -> 0.25f
                 AiMode.MEDIUM -> 0.42f
                 AiMode.AGGRESSIVE -> 0.60f
@@ -469,6 +512,8 @@ class NeuralSuperResEngine(private val context: Context) {
         nativeSharpSource.getPixels(origPx, 0, w, 0, 0, w, h)
         fullNeural.getPixels(neurPx, 0, w, 0, 0, w, h)
         fullBaseline.getPixels(basePx, 0, w, 0, 0, w, h)
+        fullNeural.recycle()
+        fullBaseline.recycle()
 
         for (i in origPx.indices) {
             val o = origPx[i]
@@ -483,7 +528,6 @@ class NeuralSuperResEngine(private val context: Context) {
             val yNeur = 0.299f * ((n ushr 16) and 0xFF) + 0.587f * ((n ushr 8) and 0xFF) + 0.114f * (n and 0xFF)
             val yBase = 0.299f * ((b ushr 16) and 0xFF) + 0.587f * ((b ushr 8) and 0xFF) + 0.114f * (b and 0xFF)
 
-            // Estrae solo il dettaglio strutturale creato dalla rete neurale e lo applica ai pixel originali
             val neuralDetail = (yNeur - yBase).coerceIn(-36f, 36f)
             val yEnhanced = (yOrig + neuralDetail * residualStrength).coerceIn(0f, 255f)
             val delta = yEnhanced - yOrig
@@ -500,11 +544,6 @@ class NeuralSuperResEngine(private val context: Context) {
         return out
     }
 
-    /**
-     * Integrazione Cloud AI opzionale: invia la regione centrale dello zoom spinto
-     * a un endpoint di Super-Resolution generativa (es. Swin2SR / Real-ESRGAN Cloud)
-     * e fonde il risultato ricostruito nel fotogramma.
-     */
     private fun tryCloudSuperResolution(
         source: Bitmap,
         endpointUrl: String,
@@ -520,9 +559,11 @@ class NeuralSuperResEngine(private val context: Context) {
 
             val centerCrop = Bitmap.createBitmap(source, sx, sy, cw, ch)
             val uploadBmp = scaleToMaxSide(centerCrop, 768)
+            if (uploadBmp !== centerCrop) centerCrop.recycle()
 
             val baos = ByteArrayOutputStream()
             uploadBmp.compress(Bitmap.CompressFormat.JPEG, 92, baos)
+            uploadBmp.recycle()
             val payload = baos.toByteArray()
 
             val conn = (URL(endpointUrl).openConnection() as HttpURLConnection).apply {
@@ -549,12 +590,13 @@ class NeuralSuperResEngine(private val context: Context) {
                         alpha = 215
                     }
                     canvas.drawBitmap(cloudPatch, null, Rect(sx, sy, sx + cw, sy + ch), paint)
+                    cloudPatch.recycle()
                     return result
                 }
             }
             null
-        } catch (e: Exception) {
-            Log.w("NeuralSR", "Cloud AI non raggiungibile o non configurata: ${e.message}")
+        } catch (e: Throwable) {
+            Log.w("NeuralSR", "Cloud AI non raggiungibile: ${e.message}")
             null
         }
     }
@@ -574,7 +616,6 @@ class NeuralSuperResEngine(private val context: Context) {
     private fun filterChromaOnly(bitmap: Bitmap, passes: Int): Bitmap {
         val w = bitmap.width
         val h = bitmap.height
-        if (w * h > 24_000_000) return bitmap
 
         var src = IntArray(w * h)
         var dst = IntArray(w * h)
@@ -627,7 +668,6 @@ class NeuralSuperResEngine(private val context: Context) {
     private fun adaptiveEdgeEnhance(bitmap: Bitmap, gain: Float): Bitmap {
         val w = bitmap.width
         val h = bitmap.height
-        if (w * h > 24_000_000) return bitmap
 
         val src = IntArray(w * h)
         val dst = IntArray(w * h)

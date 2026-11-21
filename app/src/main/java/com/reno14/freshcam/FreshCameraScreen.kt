@@ -217,7 +217,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             AndroidView(
                 factory = { ctx ->
                     PreviewView(ctx).apply {
-                        // FIT_CENTER evita il ritaglio/zoom eccessivo dell'anteprima sulla fotocamera principale 4:3
                         scaleType = PreviewView.ScaleType.FIT_CENTER
                         previewView = this
                     }
@@ -261,7 +260,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // Top Bar con Flash, HDR, GPS, AI ON/OFF, Livello AI, Cloud AI ON/OFF e Profilo
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -395,7 +393,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
 
                     Spacer(modifier = Modifier.width(5.dp))
-                    // Tasto rapido Cloud AI ON / OFF
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(16.dp))

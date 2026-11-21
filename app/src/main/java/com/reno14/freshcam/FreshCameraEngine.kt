@@ -73,12 +73,6 @@ class FreshCameraEngine(
     fun checkNeuralModelReady(): Boolean = neuralEngine.isModelAvailable()
     fun getLoadedModelName(): String = neuralEngine.loadedAssetName
 
-    /**
-     * Rilevamento accurato delle lenti fisiche posteriori:
-     * Su Oppo/ColorOS la camera "0" è spesso la camera logica multi-lente (con focale standard ~4.7-5.5mm),
-     * mentre l'ultra-grandangolo ha focale più corta (~1.6-2.2mm) e il teleobiettivo 3.5x ha focale
-     * più lunga (~12-16mm). Evita di scambiare la principale per il teleobiettivo.
-     */
     fun discoverLenses(): List<PhysicalLensInfo> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val list = mutableListOf<PhysicalLensInfo>()
@@ -97,7 +91,6 @@ class FreshCameraEngine(
                 }
             }
 
-            // La fotocamera principale standard ha focale intermedia (tra 3.8mm e 6.8mm) o id "0"
             val mainCam = backCandidates.firstOrNull { it.first == "0" && it.second in 3.5f..7.0f }
                 ?: backCandidates.firstOrNull { it.second in 3.8f..6.8f }
                 ?: backCandidates.minByOrNull { kotlin.math.abs(it.second - 5.0f) }
@@ -273,7 +266,6 @@ class FreshCameraEngine(
 
                 bound.cameraInfo.zoomState.value?.let { zs ->
                     onZoomBounds(zs.minZoomRatio, zs.maxZoomRatio)
-                    // Assicura che a 1x sulla Principale lo zoom hardware sia esattamente 1.0f (nessuno zoom indesiderato)
                     val targetRatio = if (state.activeLens == LensType.MAIN_50MP && state.displayZoom <= 1.05f) {
                         1.0f.coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
                     } else {
@@ -324,10 +316,8 @@ class FreshCameraEngine(
     }
 
     /**
-     * Scatto intelligente:
-     * - Con AI OFF: scatta 1 fotogramma istantaneo senza ritardi.
-     * - Con AI ON: scatta una raffica veloce di 3 fotogrammi (Multi-Frame Burst) da fondere
-     *   e iniettare nella rete neurale residuale per massima nitidezza e zero rumore.
+     * Cattura 3 scatti in sequenza rapida quando AI: ON è attivo (riducendo la risoluzione massima
+     * a 3200px in RAM per evitare qualsiasi OutOfMemoryError su Android).
      */
     fun shootInstant(
         snapshot: FreshCamState,
@@ -340,6 +330,7 @@ class FreshCameraEngine(
 
         val capturedLocation = if (snapshot.locationTagEnabled) getLastKnownLocation() else null
         val burstCount = if (snapshot.neuralSuperResEnabled && snapshot.captureFormat != CaptureFormat.RAW) 3 else 1
+        val maxSide = if (snapshot.neuralSuperResEnabled) 3200 else 4200
         val collectedFrames = mutableListOf<Bitmap>()
 
         fun captureNextFrame(remaining: Int) {
@@ -351,9 +342,12 @@ class FreshCameraEngine(
                             val deg = imageProxy.imageInfo.rotationDegrees
                             val rawBmp = proxyToBitmap(imageProxy)
                             val rotated = rotate(rawBmp, deg)
-                            collectedFrames.add(capSize(rotated, 4200))
-                        } catch (e: Exception) {
-                            Log.e("Reno14FreshCam", "Errore frame raffica", e)
+                            if (rotated !== rawBmp) rawBmp.recycle()
+                            val capped = capSize(rotated, maxSide)
+                            if (capped !== rotated) rotated.recycle()
+                            collectedFrames.add(capped)
+                        } catch (t: Throwable) {
+                            Log.e("Reno14FreshCam", "Errore acquisizione frame", t)
                         } finally {
                             imageProxy.close()
                         }
@@ -419,6 +413,9 @@ class FreshCameraEngine(
                     )
                 }
 
+                // Libera subito i frame sorgente per risparmiare memoria
+                frames.forEach { if (!it.isRecycled && it !== outcome.bitmap) it.recycle() }
+
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
                 val zoomTag = "${String.format(Locale.US, "%.1f", snapshot.displayZoom)}x"
                 val aiTag = if (snapshot.neuralSuperResEnabled) "_AI_${snapshot.aiMode.shortLabel}" else ""
@@ -437,6 +434,8 @@ class FreshCameraEngine(
                     context.contentResolver.openOutputStream(uri)?.use { out ->
                         outcome.bitmap.compress(Bitmap.CompressFormat.JPEG, 98, out)
                     }
+                    if (!outcome.bitmap.isRecycled) outcome.bitmap.recycle()
+
                     if (capturedLocation != null) {
                         try {
                             context.contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
@@ -453,14 +452,16 @@ class FreshCameraEngine(
                         onResult(uri.toString(), "Salvata (${outcome.modeApplied}$gpsNote)")
                     }
                 } else {
+                    if (!outcome.bitmap.isRecycled) outcome.bitmap.recycle()
                     ContextCompat.getMainExecutor(context).execute {
                         onResult(null, "Errore salvataggio in Galleria")
                     }
                 }
-            } catch (e: Exception) {
-                Log.e("Reno14FreshCam", "Errore elaborazione foto", e)
+            } catch (t: Throwable) {
+                Log.e("Reno14FreshCam", "Errore elaborazione foto", t)
+                frames.forEach { if (!it.isRecycled) it.recycle() }
                 ContextCompat.getMainExecutor(context).execute {
-                    onResult(null, "Errore foto: ${e.localizedMessage}")
+                    onResult(null, "Errore foto: ${t.localizedMessage}")
                 }
             }
         }

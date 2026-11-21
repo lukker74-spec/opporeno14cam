@@ -12,8 +12,8 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 12
-        versionName = "7.0.0-burst-cloud-ai"
+        versionCode = 13
+        versionName = "7.1.0-safe-burst-ai"
     }
 
     buildTypes {
