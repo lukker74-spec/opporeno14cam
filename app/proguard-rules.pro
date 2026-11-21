@@ -1,3 +1,1 @@
 -keep class androidx.camera.** { *; }
--keep class org.tensorflow.lite.** { *; }
--keep class com.google.ai.edge.litert.** { *; }

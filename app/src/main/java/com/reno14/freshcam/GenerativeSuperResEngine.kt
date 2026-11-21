@@ -2,46 +2,17 @@ package com.reno14.freshcam
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.util.Log
-import com.google.ai.edge.litert.Interpreter
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.sin
 
 /**
- * Motore di Super-Resolution Generativa on-device (con controllo esplicito dell'utente):
- * - Tenta di caricare un modello neurale opzionale `super_res_gan.tflite` dagli asset se presente.
- * - Se il modello non è presente negli asset, applica un algoritmo generativo di sintesi dei dettagli
- *   e ricostruzione dei bordi basato su gradiente locale + micro-trama coerente, solo quando l'utente
- *   ha attivato `generativeSuperResEnabled = true`.
+ * Motore di Super-Resolution Generativa locale su bitmap (senza dipendenze esterne mancanti):
+ * - Pulisce il rumore cromatico e di luminanza preservando i bordi.
+ * - Ricostruisce i contorni direzionali (Edge-Directed Synthesis) e i micro-dettagli
+ *   quando l'utente attiva `superResEnabled = true`.
  */
 class GenerativeSuperResEngine(private val context: Context) {
-
-    private var interpreter: Interpreter? = null
-    private var modelChecked: Boolean = false
-
-    @Synchronized
-    private fun getOrLoadModel(): Interpreter? {
-        if (modelChecked) return interpreter
-        modelChecked = true
-        return try {
-            val assetFd = context.assets.openFd("super_res_gan.tflite")
-            val inputStream = assetFd.createInputStream()
-            val bytes = inputStream.readBytes()
-            inputStream.close()
-            assetFd.close()
-
-            val buffer = ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder())
-            buffer.put(bytes)
-            buffer.rewind()
-            Interpreter(buffer).also { interpreter = it }
-        } catch (_: Exception) {
-            Log.d("GenerativeSuperRes", "Modello super_res_gan.tflite non presente negli asset: uso sintetizzatore locale")
-            null
-        }
-    }
 
     fun process(
         source: Bitmap,
@@ -63,27 +34,20 @@ class GenerativeSuperResEngine(private val context: Context) {
         val highZoom = isTeleLens && zoomRatio >= 1.8f
         val extremeZoom = isTeleLens && zoomRatio >= 3.5f
 
-        // Pulizia rumore cromatico e luminanza solo se richiesto dall'AI o dalla Super-Resolution
         if (superResEnabled || aiMode != AiMode.LOW) {
             val chromaPasses = if (extremeZoom && superResEnabled) 2 else 1
             val lumaPasses = if (extremeZoom && superResEnabled && aiMode != AiMode.LOW) 2 else 1
             current = filterChromaAndLuma(current, chromaPasses, lumaPasses)
         }
 
-        // Applica la Super-Resolution Generativa SOLO se l'utente l'ha attivata esplicitamente
         if (superResEnabled) {
-            val model = getOrLoadModel()
-            if (model != null) {
-                current = runNeuralTileSuperRes(model, current)
-            } else {
-                val gain = when {
-                    extremeZoom && aiMode == AiMode.AGGRESSIVE -> 1.15f
-                    extremeZoom -> 0.95f
-                    highZoom -> 0.80f
-                    else -> 0.65f
-                }
-                current = generativeDetailSynthesis(current, gain)
+            val gain = when {
+                extremeZoom && aiMode == AiMode.AGGRESSIVE -> 1.15f
+                extremeZoom -> 0.95f
+                highZoom -> 0.80f
+                else -> 0.65f
             }
+            current = generativeDetailSynthesis(current, gain)
         } else {
             val sharp = when (aiMode) {
                 AiMode.LOW -> 0.15f
@@ -98,52 +62,6 @@ class GenerativeSuperResEngine(private val context: Context) {
         }
 
         return current
-    }
-
-    private fun runNeuralTileSuperRes(interpreter: Interpreter, bitmap: Bitmap): Bitmap {
-        return try {
-            val inTensor = interpreter.getInputTensor(0)
-            val shape = inTensor.shape() // atteso [1, H, W, 3]
-            if (shape.size != 4) return generativeDetailSynthesis(bitmap, 0.90f)
-            val tileH = shape[1]
-            val tileW = shape[2]
-            if (tileW <= 0 || tileH <= 0) return generativeDetailSynthesis(bitmap, 0.90f)
-
-            val scaled = Bitmap.createScaledBitmap(bitmap, tileW, tileH, true)
-            val pixels = IntArray(tileW * tileH)
-            scaled.getPixels(pixels, 0, tileW, 0, 0, tileW, tileH)
-
-            val inputBuf = ByteBuffer.allocateDirect(1 * tileH * tileW * 3 * 4).order(ByteOrder.nativeOrder())
-            for (p in pixels) {
-                inputBuf.putFloat(((p ushr 16) and 0xFF) / 255f)
-                inputBuf.putFloat(((p ushr 8) and 0xFF) / 255f)
-                inputBuf.putFloat((p and 0xFF) / 255f)
-            }
-            inputBuf.rewind()
-
-            val outTensor = interpreter.getOutputTensor(0)
-            val outShape = outTensor.shape()
-            val outH = outShape[1]
-            val outW = outShape[2]
-            val outBuf = ByteBuffer.allocateDirect(1 * outH * outW * 3 * 4).order(ByteOrder.nativeOrder())
-
-            interpreter.run(inputBuf, outBuf)
-            outBuf.rewind()
-
-            val outPixels = IntArray(outW * outH)
-            for (i in outPixels.indices) {
-                val r = (outBuf.float * 255f).toInt().coerceIn(0, 255)
-                val g = (outBuf.float * 255f).toInt().coerceIn(0, 255)
-                val b = (outBuf.float * 255f).toInt().coerceIn(0, 255)
-                outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            }
-            val srBmp = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
-            srBmp.setPixels(outPixels, 0, outW, 0, 0, outW, outH)
-            Bitmap.createScaledBitmap(srBmp, bitmap.width, bitmap.height, true)
-        } catch (e: Exception) {
-            Log.w("GenerativeSuperRes", "Fallback su sintesi generativa locale: ${e.message}")
-            generativeDetailSynthesis(bitmap, 0.90f)
-        }
     }
 
     private fun generativeDetailSynthesis(bitmap: Bitmap, gain: Float): Bitmap {

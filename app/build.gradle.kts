@@ -12,8 +12,8 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "2.0.0-sr-toggle"
+        versionCode = 3
+        versionName = "2.0.1-sr-toggle"
     }
 
     buildTypes {
@@ -49,9 +49,6 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
-
-    // Runtime neurale LiteRT (ex TensorFlow Lite) per modello Super-Resolution opzionale
-    implementation("com.google.ai.edge.litert:litert:1.0.1")
 
     val cameraxVersion = "1.4.1"
     implementation("androidx.camera:camera-core:$cameraxVersion")

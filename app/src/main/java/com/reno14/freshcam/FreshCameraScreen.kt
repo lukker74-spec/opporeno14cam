@@ -213,7 +213,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // Top Bar con tasto dedicato Super-Res ON/OFF deciso dall'utente + AI + Profili + Fuoco + Impostazioni
+        // Top Bar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -265,7 +265,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
-                // Tasto diretto Super-Resolution Generativa (attiva/disattiva a scelta dell'utente)
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
@@ -282,7 +281,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             val nextSr = !state.generativeSuperResEnabled
                             state = state.copy(
                                 generativeSuperResEnabled = nextSr,
-                                bannerMessage = if (nextSr) "Super-Resolution Generativa ATTIVA" else "Super-Resolution Generativa DISATTIVATA"
+                                bannerMessage = if (nextSr) "Super-Resolution ATTIVA" else "Super-Resolution DISATTIVATA"
                             )
                         }
                         .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -297,7 +296,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // Tasto AI (Bassa / Media / Aggressiva)
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
@@ -681,15 +679,15 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
                     Text("Impostazioni Reno14 FreshCam", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                    Text("Super-Resolution Generativa a scelta · Scatto istantaneo", fontSize = 12.sp, color = Color(0xFF4FC3F7))
+                    Text("Super-Resolution a scelta · Scatto istantaneo", fontSize = 12.sp, color = Color(0xFF4FC3F7))
 
                     Spacer(modifier = Modifier.height(12.dp))
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(8.dp))
 
                     ToggleRow(
-                        title = "Super-Resolution Generativa (a scelta)",
-                        subtitle = "Attiva ricostruzione generativa dei dettagli (usa modello LiteRT se presente o sintesi direzionale locale)",
+                        title = "Super-Resolution per Zoom Spinto (a scelta)",
+                        subtitle = "Sintesi direzionale dei bordi e micro-dettaglio sul Tele 50MP",
                         checked = state.generativeSuperResEnabled,
                         onChange = { state = state.copy(generativeSuperResEnabled = it) }
                     )

@@ -145,10 +145,10 @@ enum class CaptureFormat(val label: String, val badge: String) {
 }
 
 enum class LensType(val label: String) {
-    ULTRAWIDE("Ultra-Grandangolo 8MP", "0.6x"),
-    MAIN_50MP("Principale 50MP OIS", "1x"),
-    TELE_50MP("Teleobiettivo 50MP 3.5x OIS", "3.5x"),
-    FRONT("Frontale 50MP", "Selfie")
+    ULTRAWIDE("Ultra-Grandangolo 8MP"),
+    MAIN_50MP("Principale 50MP OIS"),
+    TELE_50MP("Teleobiettivo 50MP 3.5x OIS"),
+    FRONT("Frontale 50MP")
 }
 
 enum class FocusMode(val label: String, val shortLabel: String) {
@@ -204,7 +204,6 @@ data class FreshCamState(
     val isoValue: Int = 160,
     val shutterSpeedDenom: Int = 125,
     val stabilizationEnabled: Boolean = true,
-    // Controllo esplicito dell'utente per la Super-Resolution Generativa (OFF di default, attivabile a scelta)
     val generativeSuperResEnabled: Boolean = false,
     val postSavePolishEnabled: Boolean = true,
     val gridEnabled: Boolean = true,
