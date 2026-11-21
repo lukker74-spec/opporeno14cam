@@ -73,38 +73,46 @@ class FreshCameraEngine(
     fun checkNeuralModelReady(): Boolean = neuralEngine.isModelAvailable()
     fun getLoadedModelName(): String = neuralEngine.loadedAssetName
 
+    /**
+     * Rilevamento accurato delle lenti fisiche posteriori:
+     * Su Oppo/ColorOS la camera "0" è spesso la camera logica multi-lente (con focale standard ~4.7-5.5mm),
+     * mentre l'ultra-grandangolo ha focale più corta (~1.6-2.2mm) e il teleobiettivo 3.5x ha focale
+     * più lunga (~12-16mm). Evita di scambiare la principale per il teleobiettivo.
+     */
     fun discoverLenses(): List<PhysicalLensInfo> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val list = mutableListOf<PhysicalLensInfo>()
         try {
-            val backList = mutableListOf<Pair<String, Float>>()
+            val backCandidates = mutableListOf<Pair<String, Float>>()
             for (id in manager.cameraIdList) {
                 val chars = manager.getCameraCharacteristics(id)
                 val facing = chars.get(CameraCharacteristics.LENS_FACING) ?: continue
-                val focal = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 4.5f
+                val focal = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 4.8f
                 if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
                     if (list.none { it.lensType == LensType.FRONT }) {
                         list.add(PhysicalLensInfo(id, LensType.FRONT, focal))
                     }
                 } else if (facing == CameraCharacteristics.LENS_FACING_BACK) {
-                    backList.add(id to focal)
+                    backCandidates.add(id to focal)
                 }
             }
-            val sortedBack = backList.sortedBy { it.second }
-            when {
-                sortedBack.size >= 3 -> {
-                    list.add(PhysicalLensInfo(sortedBack[0].first, LensType.ULTRAWIDE, sortedBack[0].second))
-                    list.add(PhysicalLensInfo(sortedBack[1].first, LensType.MAIN_50MP, sortedBack[1].second))
-                    list.add(PhysicalLensInfo(sortedBack.last().first, LensType.TELE_50MP, sortedBack.last().second))
-                }
-                sortedBack.size == 2 -> {
-                    list.add(PhysicalLensInfo(sortedBack[0].first, LensType.MAIN_50MP, sortedBack[0].second))
-                    list.add(PhysicalLensInfo(sortedBack[1].first, LensType.TELE_50MP, sortedBack[1].second))
-                }
-                sortedBack.size == 1 -> {
-                    list.add(PhysicalLensInfo(sortedBack[0].first, LensType.MAIN_50MP, sortedBack[0].second))
-                }
-            }
+
+            // La fotocamera principale standard ha focale intermedia (tra 3.8mm e 6.8mm) o id "0"
+            val mainCam = backCandidates.firstOrNull { it.first == "0" && it.second in 3.5f..7.0f }
+                ?: backCandidates.firstOrNull { it.second in 3.8f..6.8f }
+                ?: backCandidates.minByOrNull { kotlin.math.abs(it.second - 5.0f) }
+
+            val ultraCam = backCandidates
+                .filter { it.first != mainCam?.first && it.second < (mainCam?.second ?: 4.5f) - 0.8f }
+                .minByOrNull { it.second }
+
+            val teleCam = backCandidates
+                .filter { it.first != mainCam?.first && it.second > (mainCam?.second ?: 5.0f) + 2.0f }
+                .maxByOrNull { it.second }
+
+            mainCam?.let { list.add(PhysicalLensInfo(it.first, LensType.MAIN_50MP, it.second)) }
+            ultraCam?.let { list.add(PhysicalLensInfo(it.first, LensType.ULTRAWIDE, it.second)) }
+            teleCam?.let { list.add(PhysicalLensInfo(it.first, LensType.TELE_50MP, it.second)) }
         } catch (e: Exception) {
             Log.e("Reno14FreshCam", "Errore rilevamento fotocamere", e)
         }
@@ -114,6 +122,7 @@ class FreshCameraEngine(
 
     @SuppressLint("RestrictedApi", "UnsafeOptInUsageError")
     private fun selectorForLens(lensType: LensType): CameraSelector {
+        if (lensType == LensType.FRONT) return CameraSelector.DEFAULT_FRONT_CAMERA
         val target = discoveredLenses.firstOrNull { it.lensType == lensType }
         if (target != null) {
             return CameraSelector.Builder()
@@ -123,7 +132,7 @@ class FreshCameraEngine(
                 })
                 .build()
         }
-        return if (lensType == LensType.FRONT) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+        return CameraSelector.DEFAULT_BACK_CAMERA
     }
 
     @SuppressLint("RestrictedApi", "UnsafeOptInUsageError")
@@ -148,7 +157,7 @@ class FreshCameraEngine(
                 val captureBuilder = ImageCapture.Builder()
                     .setResolutionSelector(resSelector)
                     .setJpegQuality(99)
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
 
                 val pExt = Camera2Interop.Extender(previewBuilder)
                 val cExt = Camera2Interop.Extender(captureBuilder)
@@ -264,7 +273,13 @@ class FreshCameraEngine(
 
                 bound.cameraInfo.zoomState.value?.let { zs ->
                     onZoomBounds(zs.minZoomRatio, zs.maxZoomRatio)
-                    bound.cameraControl.setZoomRatio(state.lensZoomRatio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio))
+                    // Assicura che a 1x sulla Principale lo zoom hardware sia esattamente 1.0f (nessuno zoom indesiderato)
+                    val targetRatio = if (state.activeLens == LensType.MAIN_50MP && state.displayZoom <= 1.05f) {
+                        1.0f.coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
+                    } else {
+                        state.lensZoomRatio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
+                    }
+                    bound.cameraControl.setZoomRatio(targetRatio)
                 }
             } catch (e: Exception) {
                 Log.e("Reno14FreshCam", "Errore avvio fotocamera", e)
@@ -308,6 +323,12 @@ class FreshCameraEngine(
         return best
     }
 
+    /**
+     * Scatto intelligente:
+     * - Con AI OFF: scatta 1 fotogramma istantaneo senza ritardi.
+     * - Con AI ON: scatta una raffica veloce di 3 fotogrammi (Multi-Frame Burst) da fondere
+     *   e iniettare nella rete neurale residuale per massima nitidezza e zero rumore.
+     */
     fun shootInstant(
         snapshot: FreshCamState,
         onResult: (uriString: String?, message: String) -> Unit
@@ -318,105 +339,131 @@ class FreshCameraEngine(
         }
 
         val capturedLocation = if (snapshot.locationTagEnabled) getLastKnownLocation() else null
+        val burstCount = if (snapshot.neuralSuperResEnabled && snapshot.captureFormat != CaptureFormat.RAW) 3 else 1
+        val collectedFrames = mutableListOf<Bitmap>()
 
-        cap.takePicture(
-            ContextCompat.getMainExecutor(context),
-            object : ImageCapture.OnImageCapturedCallback() {
-                override fun onCaptureSuccess(imageProxy: ImageProxy) {
-                    val bmp: Bitmap
-                    val deg: Int
-                    try {
-                        deg = imageProxy.imageInfo.rotationDegrees
-                        bmp = proxyToBitmap(imageProxy)
-                    } catch (e: Exception) {
-                        imageProxy.close()
-                        onResult(null, "Errore acquisizione")
-                        return
-                    } finally {
-                        imageProxy.close()
+        fun captureNextFrame(remaining: Int) {
+            cap.takePicture(
+                ContextCompat.getMainExecutor(context),
+                object : ImageCapture.OnImageCapturedCallback() {
+                    override fun onCaptureSuccess(imageProxy: ImageProxy) {
+                        try {
+                            val deg = imageProxy.imageInfo.rotationDegrees
+                            val rawBmp = proxyToBitmap(imageProxy)
+                            val rotated = rotate(rawBmp, deg)
+                            collectedFrames.add(capSize(rotated, 4200))
+                        } catch (e: Exception) {
+                            Log.e("Reno14FreshCam", "Errore frame raffica", e)
+                        } finally {
+                            imageProxy.close()
+                        }
+
+                        if (remaining > 1 && collectedFrames.isNotEmpty()) {
+                            captureNextFrame(remaining - 1)
+                        } else {
+                            processAndSaveFrames(collectedFrames, snapshot, capturedLocation, onResult)
+                        }
                     }
 
-                    saveWorker.execute {
-                        try {
-                            val rotated = rotate(bmp, deg)
-                            val capped = capSize(rotated, 4800)
-
-                            val outcome = if (snapshot.captureFormat == CaptureFormat.RAW) {
-                                NeuralProcessResult(
-                                    bitmap = snapshot.profile.applyToBitmap(
-                                        source = capped,
-                                        strength = 0.0f,
-                                        brightnessBoost = snapshot.brightnessBoost
-                                    ),
-                                    modeApplied = "RAW"
-                                )
-                            } else {
-                                neuralEngine.process(
-                                    source = capped,
-                                    profile = snapshot.profile,
-                                    profileIntensity = snapshot.profileIntensity,
-                                    brightnessBoost = snapshot.brightnessBoost,
-                                    aiMode = snapshot.aiMode,
-                                    isTeleLens = snapshot.activeLens == LensType.TELE_50MP,
-                                    displayZoom = snapshot.displayZoom,
-                                    lensZoomRatio = snapshot.lensZoomRatio,
-                                    superResEnabled = snapshot.neuralSuperResEnabled,
-                                    postSavePolish = snapshot.postSavePolishEnabled
-                                )
-                            }
-
-                            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
-                            val zoomTag = "${String.format(Locale.US, "%.1f", snapshot.displayZoom)}x"
-                            val aiTag = if (snapshot.neuralSuperResEnabled) "_AI_${snapshot.aiMode.shortLabel}" else ""
-                            val name = "FreshCam_${snapshot.profile.id}_${zoomTag}${aiTag}_$stamp.jpg"
-
-                            val values = ContentValues().apply {
-                                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Reno14FreshCam")
-                                }
-                            }
-
-                            val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                            if (uri != null) {
-                                context.contentResolver.openOutputStream(uri)?.use { out ->
-                                    outcome.bitmap.compress(Bitmap.CompressFormat.JPEG, 98, out)
-                                }
-                                if (capturedLocation != null) {
-                                    try {
-                                        context.contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
-                                            val exif = ExifInterface(pfd.fileDescriptor)
-                                            exif.setGpsInfo(capturedLocation)
-                                            exif.saveAttributes()
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.w("Reno14FreshCam", "Impossibile scrivere EXIF GPS", e)
-                                    }
-                                }
-                                val gpsNote = if (capturedLocation != null) " · GPS" else ""
-                                ContextCompat.getMainExecutor(context).execute {
-                                    onResult(uri.toString(), "Salvata (${outcome.modeApplied}$gpsNote)")
-                                }
-                            } else {
-                                ContextCompat.getMainExecutor(context).execute {
-                                    onResult(null, "Errore salvataggio in Galleria")
-                                }
-                            }
-                        } catch (e: Exception) {
-                            Log.e("Reno14FreshCam", "Errore elaborazione foto", e)
-                            ContextCompat.getMainExecutor(context).execute {
-                                onResult(null, "Errore foto: ${e.localizedMessage}")
-                            }
+                    override fun onError(exception: ImageCaptureException) {
+                        if (collectedFrames.isNotEmpty()) {
+                            processAndSaveFrames(collectedFrames, snapshot, capturedLocation, onResult)
+                        } else {
+                            onResult(null, "Errore scatto: ${exception.message}")
                         }
                     }
                 }
+            )
+        }
 
-                override fun onError(exception: ImageCaptureException) {
-                    onResult(null, "Errore scatto: ${exception.message}")
+        captureNextFrame(burstCount)
+    }
+
+    private fun processAndSaveFrames(
+        frames: List<Bitmap>,
+        snapshot: FreshCamState,
+        capturedLocation: Location?,
+        onResult: (uriString: String?, message: String) -> Unit
+    ) {
+        if (frames.isEmpty()) {
+            onResult(null, "Nessun fotogramma acquisito")
+            return
+        }
+
+        saveWorker.execute {
+            try {
+                val outcome = if (snapshot.captureFormat == CaptureFormat.RAW) {
+                    NeuralProcessResult(
+                        bitmap = snapshot.profile.applyToBitmap(
+                            source = frames.first(),
+                            strength = 0.0f,
+                            brightnessBoost = snapshot.brightnessBoost
+                        ),
+                        modeApplied = "RAW"
+                    )
+                } else {
+                    neuralEngine.processBurst(
+                        frames = frames,
+                        profile = snapshot.profile,
+                        profileIntensity = snapshot.profileIntensity,
+                        brightnessBoost = snapshot.brightnessBoost,
+                        aiMode = snapshot.aiMode,
+                        isTeleLens = snapshot.activeLens == LensType.TELE_50MP,
+                        displayZoom = snapshot.displayZoom,
+                        lensZoomRatio = snapshot.lensZoomRatio,
+                        superResEnabled = snapshot.neuralSuperResEnabled,
+                        cloudAiEnabled = snapshot.cloudAiEnabled,
+                        cloudEndpointUrl = snapshot.cloudEndpointUrl,
+                        cloudApiKey = snapshot.cloudApiKey,
+                        postSavePolish = snapshot.postSavePolishEnabled
+                    )
+                }
+
+                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
+                val zoomTag = "${String.format(Locale.US, "%.1f", snapshot.displayZoom)}x"
+                val aiTag = if (snapshot.neuralSuperResEnabled) "_AI_${snapshot.aiMode.shortLabel}" else ""
+                val name = "FreshCam_${snapshot.profile.id}_${zoomTag}${aiTag}_$stamp.jpg"
+
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Reno14FreshCam")
+                    }
+                }
+
+                val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        outcome.bitmap.compress(Bitmap.CompressFormat.JPEG, 98, out)
+                    }
+                    if (capturedLocation != null) {
+                        try {
+                            context.contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                                val exif = ExifInterface(pfd.fileDescriptor)
+                                exif.setGpsInfo(capturedLocation)
+                                exif.saveAttributes()
+                            }
+                        } catch (e: Exception) {
+                            Log.w("Reno14FreshCam", "Impossibile scrivere EXIF GPS", e)
+                        }
+                    }
+                    val gpsNote = if (capturedLocation != null) " · GPS" else ""
+                    ContextCompat.getMainExecutor(context).execute {
+                        onResult(uri.toString(), "Salvata (${outcome.modeApplied}$gpsNote)")
+                    }
+                } else {
+                    ContextCompat.getMainExecutor(context).execute {
+                        onResult(null, "Errore salvataggio in Galleria")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("Reno14FreshCam", "Errore elaborazione foto", e)
+                ContextCompat.getMainExecutor(context).execute {
+                    onResult(null, "Errore foto: ${e.localizedMessage}")
                 }
             }
-        )
+        }
     }
 
     @SuppressLint("MissingPermission")

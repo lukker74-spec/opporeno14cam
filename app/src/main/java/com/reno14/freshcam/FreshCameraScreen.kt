@@ -33,10 +33,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Camera
 import androidx.compose.material.icons.filled.Cameraswitch
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
@@ -56,6 +59,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
@@ -213,7 +217,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             AndroidView(
                 factory = { ctx ->
                     PreviewView(ctx).apply {
-                        scaleType = PreviewView.ScaleType.FILL_CENTER
+                        // FIT_CENTER evita il ritaglio/zoom eccessivo dell'anteprima sulla fotocamera principale 4:3
+                        scaleType = PreviewView.ScaleType.FIT_CENTER
                         previewView = this
                     }
                 },
@@ -256,6 +261,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
+        // Top Bar con Flash, HDR, GPS, AI ON/OFF, Livello AI, Cloud AI ON/OFF e Profilo
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -346,7 +352,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         )
                         .clickable {
                             val nextSr = !state.neuralSuperResEnabled
-                            val msg = if (nextSr) "Rete Neurale AI: ON (${state.aiMode.shortLabel})" else "Rete Neurale AI: OFF"
+                            val msg = if (nextSr) "Burst + Rete Neurale: ON (${state.aiMode.shortLabel})" else "AI: OFF"
                             state = state.copy(neuralSuperResEnabled = nextSr, bannerMessage = msg)
                         }
                         .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -376,7 +382,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                                     AiMode.MEDIUM -> AiMode.AGGRESSIVE
                                     AiMode.AGGRESSIVE -> AiMode.LOW
                                 }
-                                state = state.copy(aiMode = nextLevel, bannerMessage = "Livello Rete Neurale: ${nextLevel.shortLabel}")
+                                state = state.copy(aiMode = nextLevel, bannerMessage = "Livello AI: ${nextLevel.shortLabel}")
                             }
                             .padding(horizontal = 9.dp, vertical = 6.dp)
                     ) {
@@ -385,6 +391,35 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             color = Color(0xFF80DEEA),
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(5.dp))
+                    // Tasto rapido Cloud AI ON / OFF
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(
+                                if (state.cloudAiEnabled) Color(0xFF7E57C2).copy(alpha = 0.90f)
+                                else Color.Black.copy(alpha = 0.65f)
+                            )
+                            .border(
+                                1.dp,
+                                if (state.cloudAiEnabled) Color.White else Color.White.copy(alpha = 0.30f),
+                                RoundedCornerShape(16.dp)
+                            )
+                            .clickable {
+                                val nextCloud = !state.cloudAiEnabled
+                                val msg = if (nextCloud) "Cloud AI Generativa: ON" else "Cloud AI: OFF"
+                                state = state.copy(cloudAiEnabled = nextCloud, bannerMessage = msg)
+                            }
+                            .padding(horizontal = 8.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (state.cloudAiEnabled) Icons.Default.Cloud else Icons.Default.CloudOff,
+                            contentDescription = "Cloud AI",
+                            tint = Color.White,
+                            modifier = Modifier.size(14.dp)
                         )
                     }
                 }
@@ -515,7 +550,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         )
                     )
                     Text(
-                        text = if (state.neuralSuperResEnabled) "NN ${state.aiMode.shortLabel.uppercase()}" else "AI OFF",
+                        text = if (state.neuralSuperResEnabled) "BURST+NN" else "AI OFF",
                         color = if (state.neuralSuperResEnabled) Color(0xFF26C6DA) else Color.White.copy(alpha = 0.65f),
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
@@ -787,13 +822,16 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 contentColor = Color.White
             ) {
                 Column(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
                     Text("Impostazioni Reno14 FreshCam", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Text(
-                        text = if (state.isNeuralModelReady) "Rete Neurale: ${state.loadedModelName} attiva (1x → 60x)" else "Attenzione: file .tflite non rilevato",
+                        text = if (state.isNeuralModelReady) "Motore: Multi-Frame Burst + ${state.loadedModelName} (Residuale)" else "Motore: Multi-Frame Burst 3x attivo",
                         fontSize = 12.sp,
-                        color = if (state.isNeuralModelReady) Color(0xFF4FC3F7) else Color(0xFFFF7043)
+                        color = Color(0xFF4FC3F7)
                     )
 
                     Spacer(modifier = Modifier.height(12.dp))
@@ -801,14 +839,14 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     Spacer(modifier = Modifier.height(8.dp))
 
                     ToggleRow(
-                        title = "Rete Neurale AI (ON / OFF)",
-                        subtitle = "Discreta su 1x, forte su zoom spinto fino a 60x con ancoraggio colori anti-artefatti",
+                        title = "AI Locale (Multi-Frame Burst + Rete Neurale)",
+                        subtitle = "Fonde 3 scatti allineati e inietta solo dettagli neurali ad alta frequenza senza impastare",
                         checked = state.neuralSuperResEnabled,
                         onChange = { state = state.copy(neuralSuperResEnabled = it) }
                     )
 
                     if (state.neuralSuperResEnabled) {
-                        Text("Intensità Rete Neurale: ${state.aiMode.shortLabel}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF80DEEA))
+                        Text("Intensità AI Locale: ${state.aiMode.shortLabel}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF80DEEA))
                         Spacer(modifier = Modifier.height(6.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             AiMode.entries.forEach { mode ->
@@ -820,6 +858,31 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             }
                         }
                         Spacer(modifier = Modifier.height(8.dp))
+                    }
+
+                    ToggleRow(
+                        title = "AI Generativa in Cloud (Opzionale)",
+                        subtitle = "Invia il ritaglio centrale dello zoom spinto a Swin2SR/Diffusion Cloud per ricostruzione avanzata",
+                        checked = state.cloudAiEnabled,
+                        onChange = { state = state.copy(cloudAiEnabled = it) }
+                    )
+
+                    if (state.cloudAiEnabled) {
+                        OutlinedTextField(
+                            value = state.cloudApiKey,
+                            onValueChange = { state = state.copy(cloudApiKey = it) },
+                            label = { Text("Token API Hugging Face (hf_...)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                        )
+                        OutlinedTextField(
+                            value = state.cloudEndpointUrl,
+                            onValueChange = { state = state.copy(cloudEndpointUrl = it) },
+                            label = { Text("URL Modello Cloud SR") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
                     }
 
                     ToggleRow(

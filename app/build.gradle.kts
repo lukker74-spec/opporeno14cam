@@ -12,8 +12,8 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 11
-        versionName = "6.0.0-neural-zoom"
+        versionCode = 12
+        versionName = "7.0.0-burst-cloud-ai"
     }
 
     buildTypes {
