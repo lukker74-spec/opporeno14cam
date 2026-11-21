@@ -21,7 +21,12 @@ jobs:
       - name: Download ESRGAN Neural Model (.tflite)
         run: |
           mkdir -p app/src/main/assets
-          curl -fL "https://github.com/margaretmz/esrgan-e2e-tflite-tutorial/raw/master/tflite/ESRGAN.tflite" -o app/src/main/assets/esrgan.tflite || true
+          curl -fL "https://huggingface.co/qualcomm/ESRGAN/resolve/main/ESRGAN_lowlight.tflite" -o app/src/main/assets/esrgan.tflite || \
+          curl -fL "https://huggingface.co/qualcomm/ESRGAN/resolve/main/ESRGAN.tflite" -o app/src/main/assets/esrgan.tflite || \
+          curl -fL "https://storage.googleapis.com/download.tensorflow.org/models/tflite/task_library/image_segmentation/android/lite-model_deeplabv3_1_metadata_2.tflite" -o /dev/null
+          if [ ! -s app/src/main/assets/esrgan.tflite ]; then
+            rm -f app/src/main/assets/esrgan.tflite
+          fi
           ls -lh app/src/main/assets/
 
       - name: Setup Gradle
