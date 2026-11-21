@@ -329,13 +329,16 @@ class FreshCameraEngine(
                                     profile = snapshot.profile,
                                     profileIntensity = snapshot.profileIntensity,
                                     brightnessBoost = snapshot.brightnessBoost,
+                                    aiMode = snapshot.aiMode,
+                                    isTeleLens = snapshot.activeLens == LensType.TELE_50MP,
+                                    zoomRatio = snapshot.zoomRatio,
                                     superResEnabled = snapshot.neuralSuperResEnabled,
                                     postSavePolish = snapshot.postSavePolishEnabled
                                 )
                             }
 
                             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
-                            val srTag = if (outcome.neuralApplied) "_ESRGAN" else ""
+                            val srTag = if (outcome.neuralApplied) "_SR" else ""
                             val name = "FreshCam_${snapshot.profile.id}_${snapshot.activeLens.name.lowercase()}${srTag}_$stamp.jpg"
 
                             val values = ContentValues().apply {

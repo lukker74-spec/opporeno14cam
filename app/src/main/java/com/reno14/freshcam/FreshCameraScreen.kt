@@ -215,7 +215,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // Top Bar con tasto SR: ON / OFF per la rete neurale ESRGAN
+        // Top Bar con tasto SR: ON / OFF
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -281,12 +281,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         )
                         .clickable {
                             val nextSr = !state.neuralSuperResEnabled
-                            val msg = if (nextSr) {
-                                if (state.isNeuralModelReady) "Rete Neurale ESRGAN: ON"
-                                else "SR: ON (attesa modello esrgan.tflite)"
-                            } else {
-                                "Rete Neurale ESRGAN: OFF"
-                            }
+                            val msg = if (nextSr) "Super-Resolution SR: ON" else "Super-Resolution SR: OFF"
                             state = state.copy(neuralSuperResEnabled = nextSr, bannerMessage = msg)
                         }
                         .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -659,9 +654,9 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 ) {
                     Text("Impostazioni Reno14 FreshCam", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Text(
-                        text = if (state.isNeuralModelReady) "Modello Neurale ESRGAN (.tflite): CARICATO" else "Modello Neurale ESRGAN (.tflite): NON TROVATO",
+                        text = if (state.isNeuralModelReady) "Motore SR: Modello ESRGAN (.tflite) attivo" else "Motore SR: Recupero dettagli locale attivo",
                         fontSize = 12.sp,
-                        color = if (state.isNeuralModelReady) Color(0xFF66BB6A) else Color(0xFFFF7043)
+                        color = Color(0xFF4FC3F7)
                     )
 
                     Spacer(modifier = Modifier.height(12.dp))
@@ -669,8 +664,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     Spacer(modifier = Modifier.height(8.dp))
 
                     ToggleRow(
-                        title = "Rete Neurale ESRGAN Super-Resolution (ON / OFF)",
-                        subtitle = "Esegue inferenza neurale reale TensorFlow Lite sull'area centrale dell'immagine",
+                        title = "Super-Resolution / Recupero Dettagli (ON / OFF)",
+                        subtitle = "Elabora bordi, pulizia rumore e micro-dettaglio in background quando attivo",
                         checked = state.neuralSuperResEnabled,
                         onChange = { state = state.copy(neuralSuperResEnabled = it) }
                     )
