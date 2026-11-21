@@ -13,6 +13,7 @@ import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sin
 
 data class NeuralProcessResult(
@@ -21,6 +22,14 @@ data class NeuralProcessResult(
     val detailNote: String
 )
 
+/**
+ * Motore ibrido ottimizzato (Scelta migliore tra Opzione A e Opzione B):
+ * 1. Pulisce il rumore cromatico e di luminanza PRIMA dell'elaborazione, evitando che il rumore
+ *    del sensore teleobiettivo venga amplificato.
+ * 2. Applica ESRGAN (se presente) su piccoli ritagli nativi senza schiacciare intere porzioni
+ *    a bassa risoluzione, fondendo il dettaglio neurale con l'immagine pulita per evitare artefatti.
+ * 3. Applica un recupero direzionale dei bordi calibrato per preservare naturalezza.
+ */
 class NeuralSuperResEngine(private val context: Context) {
 
     private var interpreter: Interpreter? = null
@@ -85,63 +94,146 @@ class NeuralSuperResEngine(private val context: Context) {
             )
         }
 
-        val tflite = getInterpreter()
-        if (tflite != null) {
-            return try {
-                val enhanced = runEsrganTiledInference(tflite, working)
-                val finalBmp = if (postSavePolish) applyToneBalance(enhanced, strong = true) else enhanced
-                NeuralProcessResult(
-                    bitmap = finalBmp,
-                    neuralApplied = true,
-                    detailNote = "Rete Neurale ESRGAN applicata"
-                )
-            } catch (e: Exception) {
-                Log.e("NeuralSR", "Errore inferenza ESRGAN, uso recupero dettagli locale", e)
-                val fallback = localSuperResFallback(working, aiMode, isTeleLens, zoomRatio)
-                val finalBmp = if (postSavePolish) applyToneBalance(fallback, strong = true) else fallback
-                NeuralProcessResult(
-                    bitmap = finalBmp,
-                    neuralApplied = true,
-                    detailNote = "SR attivo (recupero dettagli locale)"
-                )
-            }
-        }
-
-        // Fallback automatico quando esrgan.tflite non è presente nell'APK:
-        // esegue comunque un recupero dettagli e pulizia rumore visibile quando SR: ON è attivo
-        val localEnhanced = localSuperResFallback(working, aiMode, isTeleLens, zoomRatio)
-        val finalBmp = if (postSavePolish) applyToneBalance(localEnhanced, strong = true) else localEnhanced
-        return NeuralProcessResult(
-            bitmap = finalBmp,
-            neuralApplied = true,
-            detailNote = "SR attivo (motore locale · .tflite assente)"
-        )
-    }
-
-    private fun localSuperResFallback(
-        bitmap: Bitmap,
-        aiMode: AiMode,
-        isTeleLens: Boolean,
-        zoomRatio: Float
-    ): Bitmap {
-        val highZoom = isTeleLens && zoomRatio >= 1.5f
         val extremeZoom = isTeleLens && zoomRatio >= 3.0f
+        val highZoom = isTeleLens && zoomRatio >= 1.5f
 
-        var cur = filterChromaAndLuma(
-            bitmap = bitmap,
+        // 1. Pre-denoise mirato per eliminare la grana del sensore prima di qualsiasi dettaglio
+        val denoised = filterChromaAndLuma(
+            bitmap = working,
             chromaPasses = if (extremeZoom || isTeleLens) 2 else 1,
             lumaPasses = if (extremeZoom || aiMode == AiMode.AGGRESSIVE) 2 else 1
         )
-        val gain = when {
-            extremeZoom && aiMode == AiMode.AGGRESSIVE -> 1.35f
-            extremeZoom -> 1.15f
-            highZoom || isTeleLens -> 0.95f
-            aiMode == AiMode.AGGRESSIVE -> 1.05f
-            else -> 0.80f
+
+        val tflite = getInterpreter()
+        var neuralUsed = false
+        var baseAfterNeural = denoised
+
+        if (tflite != null) {
+            try {
+                baseAfterNeural = runSelectiveEsrganBlend(
+                    tflite = tflite,
+                    cleanSource = denoised,
+                    extremeZoom = extremeZoom,
+                    highZoom = highZoom
+                )
+                neuralUsed = true
+            } catch (e: Exception) {
+                Log.e("NeuralSR", "Errore inferenza ESRGAN selettiva, uso fusione locale", e)
+                baseAfterNeural = denoised
+            }
         }
-        cur = edgeDirectedDetail(cur, gain)
-        cur = unsharpDetail(cur, gain * 0.40f)
-        return cur
+
+        // 2. Recupero direzionale controllato e fusione naturale per non impastare
+        val detailGain = when {
+            extremeZoom && aiMode == AiMode.AGGRESSIVE -> 0.55f
+            extremeZoom -> 0.42f
+            highZoom || isTeleLens -> 0.35f
+            aiMode == AiMode.AGGRESSIVE -> 0.40f
+            else -> 0.28f
+        }
+        var blended = edgeDirectedBlend(baseAfterNeural, detailGain)
+        if (postSavePolish) {
+            blended = applyToneBalance(blended, strong = false)
+        }
+
+        val note = if (neuralUsed) {
+            "SR Ibrido (ESRGAN + Denoise)"
+        } else {
+            "SR Ibrido (Denoise + Dettagli)"
+        }
+
+        return NeuralProcessResult(
+            bitmap = blended,
+            neuralApplied = true,
+            detailNote = note
+        )
+    }
+
+    /**
+     * Elabora con ESRGAN solo un riquadro centrale contenuto (50% del lato) diviso in una griglia
+     * 3x3 di patch native senza schiacciamenti estremi, fondendo il risultato con alpha moderato
+     * per evitare artefatti e stacchi visivi rispetto al resto della foto.
+     */
+    private fun runSelectiveEsrganBlend(
+        tflite: Interpreter,
+        cleanSource: Bitmap,
+        extremeZoom: Boolean,
+        highZoom: Boolean
+    ): Bitmap {
+        val inShape = tflite.getInputTensor(0).shape()
+        val outShape = tflite.getOutputTensor(0).shape()
+
+        val inH = if (inShape.size == 4 && inShape[1] > 0) inShape[1] else 50
+        val inW = if (inShape.size == 4 && inShape[2] > 0) inShape[2] else 50
+        val outH = if (outShape.size == 4 && outShape[1] > 0) outShape[1] else inH * 4
+        val outW = if (outShape.size == 4 && outShape[2] > 0) outShape[2] else inW * 4
+
+        val result = cleanSource.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(result)
+
+        val ratio = if (extremeZoom) 0.45f else if (highZoom) 0.50f else 0.40f
+        val regionW = (cleanSource.width * ratio).toInt().coerceAtLeast(inW * 3).coerceAtMost(cleanSource.width)
+        val regionH = (cleanSource.height * ratio).toInt().coerceAtLeast(inH * 3).coerceAtMost(cleanSource.height)
+
+        val startX = (cleanSource.width - regionW) / 2
+        val startY = (cleanSource.height - regionH) / 2
+        val cols = 3
+        val rows = 3
+        val cellW = regionW / cols
+        val cellH = regionH / rows
+
+        val inputBuffer = ByteBuffer.allocateDirect(1 * inH * inW * 3 * 4).order(ByteOrder.nativeOrder())
+        val outputBuffer = ByteBuffer.allocateDirect(1 * outH * outW * 3 * 4).order(ByteOrder.nativeOrder())
+        val tilePixels = IntArray(inW * inH)
+        val outPixels = IntArray(outW * outH)
+
+        // Fusione moderata per mantenere texture reale e zero aloni
+        val blendAlpha = if (extremeZoom) 115 else 90
+        val blendPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+            alpha = blendAlpha
+        }
+
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                val left = startX + c * cellW
+                val top = startY + r * cellH
+                val right = if (c == cols - 1) startX + regionW else left + cellW
+                val bottom = if (r == rows - 1) startY + regionH else top + cellH
+
+                val cw = (right - left).coerceAtLeast(1)
+                val ch = (bottom - top).coerceAtLeast(1)
+
+                val crop = Bitmap.createBitmap(cleanSource, left, top, cw, ch)
+                val scaledIn = Bitmap.createScaledBitmap(crop, inW, inH, true)
+                scaledIn.getPixels(tilePixels, 0, inW, 0, 0, inW, inH)
+
+                inputBuffer.rewind()
+                for (p in tilePixels) {
+                    inputBuffer.putFloat(((p ushr 16) and 0xFF).toFloat())
+                    inputBuffer.putFloat(((p ushr 8) and 0xFF).toFloat())
+                    inputBuffer.putFloat((p and 0xFF).toFloat())
+                }
+                inputBuffer.rewind()
+                outputBuffer.rewind()
+
+                tflite.run(inputBuffer, outputBuffer)
+                outputBuffer.rewind()
+
+                for (i in outPixels.indices) {
+                    val red = outputBuffer.float.toInt().coerceIn(0, 255)
+                    val green = outputBuffer.float.toInt().coerceIn(0, 255)
+                    val blue = outputBuffer.float.toInt().coerceIn(0, 255)
+                    outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+                }
+
+                val srPatch = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+                srPatch.setPixels(outPixels, 0, outW, 0, 0, outW, outH)
+
+                canvas.drawBitmap(srPatch, null, Rect(left, top, right, bottom), blendPaint)
+            }
+        }
+
+        return result
     }
 
     private fun filterChromaAndLuma(bitmap: Bitmap, chromaPasses: Int, lumaPasses: Int): Bitmap {
@@ -175,7 +267,7 @@ class NeuralSuperResEngine(private val context: Context) {
                         val ng = (n ushr 8) and 0xFF
                         val nb = n and 0xFF
                         val yN = (77 * nr + 150 * ng + 29 * nb) shr 8
-                        if (abs(yCenter - yN) < 26) {
+                        if (abs(yCenter - yN) < 28) {
                             sumU += (nb - yN)
                             sumV += (nr - yN)
                             cnt++
@@ -213,7 +305,7 @@ class NeuralSuperResEngine(private val context: Context) {
                         val nr = (n ushr 16) and 0xFF
                         val ng = (n ushr 8) and 0xFF
                         val nb = n and 0xFF
-                        if ((abs(cr - nr) + abs(cg - ng) + abs(cb - nb)) / 3 < 22) {
+                        if ((abs(cr - nr) + abs(cg - ng) + abs(cb - nb)) / 3 < 24) {
                             sumR += nr
                             sumG += ng
                             sumB += nb
@@ -235,7 +327,7 @@ class NeuralSuperResEngine(private val context: Context) {
         return out
     }
 
-    private fun edgeDirectedDetail(bitmap: Bitmap, gain: Float): Bitmap {
+    private fun edgeDirectedBlend(bitmap: Bitmap, gain: Float): Bitmap {
         val w = bitmap.width
         val h = bitmap.height
         if (w * h > 20_000_000) return bitmap
@@ -257,26 +349,6 @@ class NeuralSuperResEngine(private val context: Context) {
                 val s = src[idx + w]
                 val e = src[idx + 1]
                 val west = src[idx - 1]
-                val nw = src[idx - w - 1]
-                val ne = src[idx - w + 1]
-                val sw = src[idx + w - 1]
-                val se = src[idx + w + 1]
-
-                val gradH = abs(((e ushr 8) and 0xFF) - ((west ushr 8) and 0xFF))
-                val gradV = abs(((n ushr 8) and 0xFF) - ((s ushr 8) and 0xFF))
-                val gradD1 = abs(((nw ushr 8) and 0xFF) - ((se ushr 8) and 0xFF))
-                val gradD2 = abs(((ne ushr 8) and 0xFF) - ((sw ushr 8) and 0xFF))
-
-                val (p1, p2) = when (minOf(gradH, gradV, gradD1, gradD2)) {
-                    gradH -> e to west
-                    gradV -> n to s
-                    gradD1 -> nw to se
-                    else -> ne to sw
-                }
-
-                val dirR = (((p1 ushr 16) and 0xFF) + ((p2 ushr 16) and 0xFF)) / 2
-                val dirG = (((p1 ushr 8) and 0xFF) + ((p2 ushr 8) and 0xFF)) / 2
-                val dirB = ((p1 and 0xFF) + (p2 and 0xFF)) / 2
 
                 val avgR = (((n ushr 16) and 0xFF) + ((s ushr 16) and 0xFF) + ((e ushr 16) and 0xFF) + ((west ushr 16) and 0xFF)) / 4
                 val avgG = (((n ushr 8) and 0xFF) + ((s ushr 8) and 0xFF) + ((e ushr 8) and 0xFF) + ((west ushr 8) and 0xFF)) / 4
@@ -286,10 +358,10 @@ class NeuralSuperResEngine(private val context: Context) {
                 val hfG = cg - avgG
                 val hfB = cb - avgB
 
-                val detailGain = gain * 0.90f
-                val outR = if (abs(hfR) > 2) ((cr * 0.70f + dirR * 0.30f) + hfR * detailGain).toInt().coerceIn(0, 255) else cr
-                val outG = if (abs(hfG) > 2) ((cg * 0.70f + dirG * 0.30f) + hfG * detailGain).toInt().coerceIn(0, 255) else cg
-                val outB = if (abs(hfB) > 2) ((cb * 0.70f + dirB * 0.30f) + hfB * detailGain).toInt().coerceIn(0, 255) else cb
+                // Soglia più alta (4) per non amplificare la grana fine
+                val outR = if (abs(hfR) > 4) (cr + hfR * gain).toInt().coerceIn(0, 255) else cr
+                val outG = if (abs(hfG) > 4) (cg + hfG * gain).toInt().coerceIn(0, 255) else cg
+                val outB = if (abs(hfB) > 4) (cb + hfB * gain).toInt().coerceIn(0, 255) else cb
 
                 dst[idx] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
             }
@@ -301,120 +373,14 @@ class NeuralSuperResEngine(private val context: Context) {
         return out
     }
 
-    private fun unsharpDetail(bitmap: Bitmap, strength: Float): Bitmap {
-        if (strength <= 0.02f) return bitmap
-        val w = bitmap.width
-        val h = bitmap.height
-        val blur = Bitmap.createScaledBitmap(
-            Bitmap.createScaledBitmap(bitmap, max(1, w / 3), max(1, h / 3), true),
-            w, h, true
-        )
-        val src = IntArray(w * h)
-        val blr = IntArray(w * h)
-        bitmap.getPixels(src, 0, w, 0, 0, w, h)
-        blur.getPixels(blr, 0, w, 0, 0, w, h)
-
-        for (i in src.indices) {
-            val s = src[i]
-            val b = blr[i]
-            val sr = (s ushr 16) and 0xFF
-            val sg = (s ushr 8) and 0xFF
-            val sb = s and 0xFF
-            val dR = sr - ((b ushr 16) and 0xFF)
-            val dG = sg - ((b ushr 8) and 0xFF)
-            val dB = sb - (b and 0xFF)
-            val nr = if (abs(dR) > 3) (sr + dR * strength).toInt().coerceIn(0, 255) else sr
-            val ng = if (abs(dG) > 3) (sg + dG * strength).toInt().coerceIn(0, 255) else sg
-            val nb = if (abs(dB) > 3) (sb + dB * strength).toInt().coerceIn(0, 255) else sb
-            src[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
-        }
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(src, 0, w, 0, 0, w, h)
-        return out
-    }
-
-    private fun runEsrganTiledInference(tflite: Interpreter, source: Bitmap): Bitmap {
-        val inShape = tflite.getInputTensor(0).shape()
-        val outShape = tflite.getOutputTensor(0).shape()
-
-        val inH = if (inShape.size == 4 && inShape[1] > 0) inShape[1] else 50
-        val inW = if (inShape.size == 4 && inShape[2] > 0) inShape[2] else 50
-        val outH = if (outShape.size == 4 && outShape[1] > 0) outShape[1] else inH * 4
-        val outW = if (outShape.size == 4 && outShape[2] > 0) outShape[2] else inW * 4
-
-        val resultBitmap = source.copy(Bitmap.Config.ARGB_8888, true)
-        val canvas = Canvas(resultBitmap)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-
-        val gridCols = 4
-        val gridRows = 4
-        val regionW = (source.width * 0.70f).toInt().coerceAtLeast(inW * gridCols)
-            .coerceAtMost(source.width)
-        val regionH = (source.height * 0.70f).toInt().coerceAtLeast(inH * gridRows)
-            .coerceAtMost(source.height)
-
-        val startX = (source.width - regionW) / 2
-        val startY = (source.height - regionH) / 2
-        val cellW = regionW / gridCols
-        val cellH = regionH / gridRows
-
-        val inputBuffer = ByteBuffer.allocateDirect(1 * inH * inW * 3 * 4).order(ByteOrder.nativeOrder())
-        val outputBuffer = ByteBuffer.allocateDirect(1 * outH * outW * 3 * 4).order(ByteOrder.nativeOrder())
-        val tilePixels = IntArray(inW * inH)
-        val outPixels = IntArray(outW * outH)
-
-        for (r in 0 until gridRows) {
-            for (c in 0 until gridCols) {
-                val srcLeft = startX + c * cellW
-                val srcTop = startY + r * cellH
-                val srcRight = if (c == gridCols - 1) startX + regionW else srcLeft + cellW
-                val srcBottom = if (r == gridRows - 1) startY + regionH else srcTop + cellH
-
-                val cropW = (srcRight - srcLeft).coerceAtLeast(1)
-                val cropH = (srcBottom - srcTop).coerceAtLeast(1)
-
-                val crop = Bitmap.createBitmap(source, srcLeft, srcTop, cropW, cropH)
-                val modelInputBmp = Bitmap.createScaledBitmap(crop, inW, inH, true)
-                modelInputBmp.getPixels(tilePixels, 0, inW, 0, 0, inW, inH)
-
-                inputBuffer.rewind()
-                for (p in tilePixels) {
-                    inputBuffer.putFloat(((p ushr 16) and 0xFF).toFloat())
-                    inputBuffer.putFloat(((p ushr 8) and 0xFF).toFloat())
-                    inputBuffer.putFloat((p and 0xFF).toFloat())
-                }
-                inputBuffer.rewind()
-                outputBuffer.rewind()
-
-                tflite.run(inputBuffer, outputBuffer)
-                outputBuffer.rewind()
-
-                for (i in outPixels.indices) {
-                    val red = outputBuffer.float.toInt().coerceIn(0, 255)
-                    val green = outputBuffer.float.toInt().coerceIn(0, 255)
-                    val blue = outputBuffer.float.toInt().coerceIn(0, 255)
-                    outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
-                }
-
-                val srTile = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
-                srTile.setPixels(outPixels, 0, outW, 0, 0, outW, outH)
-
-                val dstRect = Rect(srcLeft, srcTop, srcRight, srcBottom)
-                canvas.drawBitmap(srTile, null, dstRect, paint)
-            }
-        }
-
-        return resultBitmap
-    }
-
     private fun applyToneBalance(bitmap: Bitmap, strong: Boolean): Bitmap {
         val w = bitmap.width
         val h = bitmap.height
         val pixels = IntArray(w * h)
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        val curve = if (strong) 0.06 else 0.035
-        val lift = if (strong) 12.0 else 7.0
+        val curve = if (strong) 0.045 else 0.03
+        val lift = if (strong) 9.0 else 6.0
 
         val lut = IntArray(256)
         for (v in 0..255) {

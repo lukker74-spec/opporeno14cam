@@ -12,8 +12,8 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 7
-        versionName = "3.1.0-sr-fallback"
+        versionCode = 8
+        versionName = "3.2.0-hybrid-sr"
     }
 
     buildTypes {

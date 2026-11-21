@@ -654,7 +654,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 ) {
                     Text("Impostazioni Reno14 FreshCam", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Text(
-                        text = if (state.isNeuralModelReady) "Motore SR: Modello ESRGAN (.tflite) attivo" else "Motore SR: Recupero dettagli locale attivo",
+                        text = if (state.isNeuralModelReady) "Motore SR: Ibrido ESRGAN + Denoise attivo" else "Motore SR: Ibrido Denoise + Dettagli attivo",
                         fontSize = 12.sp,
                         color = Color(0xFF4FC3F7)
                     )
@@ -664,8 +664,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     Spacer(modifier = Modifier.height(8.dp))
 
                     ToggleRow(
-                        title = "Super-Resolution / Recupero Dettagli (ON / OFF)",
-                        subtitle = "Elabora bordi, pulizia rumore e micro-dettaglio in background quando attivo",
+                        title = "Super-Resolution Ibrida (ON / OFF)",
+                        subtitle = "Pulisce prima il rumore del teleobiettivo e fonde il dettaglio in modo naturale",
                         checked = state.neuralSuperResEnabled,
                         onChange = { state = state.copy(neuralSuperResEnabled = it) }
                     )

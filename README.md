@@ -1,3 +1,3 @@
-# Reno14 FreshCam v3.1
+# Reno14 FreshCam v3.2 (Motore Ibrido Denoise + ESRGAN dosato)
 
-Aggiornato il download del modello nel workflow GitHub Actions e aggiunto il recupero automatico dei dettagli e pulizia del rumore quando `SR: ON` è attivo, così c'è sempre una differenza rispetto a `SR: OFF` anche se il file `.tflite` remoto non è disponibile.
+Combina pre-pulizia del rumore sul teleobiettivo, applicazione controllata di ESRGAN su una porzione centrale ridotta con fusione parziale per evitare artefatti e recupero direzionale moderato.
