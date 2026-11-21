@@ -20,13 +20,16 @@ jobs:
 
       - name: Download ESRGAN Neural Model (.tflite)
         run: |
-          mkdir -p app/src/main/assets
-          curl -fL "https://huggingface.co/qualcomm/ESRGAN/resolve/main/ESRGAN_lowlight.tflite" -o app/src/main/assets/esrgan.tflite || \
-          curl -fL "https://huggingface.co/qualcomm/ESRGAN/resolve/main/ESRGAN.tflite" -o app/src/main/assets/esrgan.tflite || \
-          curl -fL "https://storage.googleapis.com/download.tensorflow.org/models/tflite/task_library/image_segmentation/android/lite-model_deeplabv3_1_metadata_2.tflite" -o /dev/null
-          if [ ! -s app/src/main/assets/esrgan.tflite ]; then
-            rm -f app/src/main/assets/esrgan.tflite
+          mkdir -p app/src/main/assets tmp_model
+          curl -fL "https://www.kaggle.com/api/v1/models/kaggle/esrgan-tf2/tfLite/esrgan-tf2/1/download" -o tmp_model/model.tar.gz
+          tar -xzf tmp_model/model.tar.gz -C tmp_model
+          FOUND_TFLITE=$(find tmp_model -name "*.tflite" | head -n 1)
+          if [ -z "$FOUND_TFLITE" ] || [ ! -s "$FOUND_TFLITE" ]; then
+            echo "ERRORE: nessun file .tflite valido trovato nell'archivio"
+            exit 1
           fi
+          cp "$FOUND_TFLITE" app/src/main/assets/esrgan.tflite
+          rm -rf tmp_model
           ls -lh app/src/main/assets/
 
       - name: Setup Gradle
