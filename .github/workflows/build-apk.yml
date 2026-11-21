@@ -1,4 +1,4 @@
-name: Build Reno14 FreshCam APK
+name: Build Reno14 FreshCam Neural APK
 
 on:
   push:
@@ -18,6 +18,12 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Download ESRGAN Neural Model (.tflite)
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fL "https://github.com/margaretmz/esrgan-e2e-tflite-tutorial/raw/master/tflite/ESRGAN.tflite" -o app/src/main/assets/esrgan.tflite || true
+          ls -lh app/src/main/assets/
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -29,5 +35,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reno14-FreshCam-APK
+          name: Reno14-FreshCam-Neural-APK
           path: app/build/outputs/apk/debug/app-debug.apk
