@@ -153,7 +153,6 @@ class FreshCameraEngine(
                 val pExt = Camera2Interop.Extender(previewBuilder)
                 val cExt = Camera2Interop.Extender(captureBuilder)
 
-                // Massimizza qualità ottica e ISP Hardware sul sensore
                 val nrMode = if (state.captureFormat == CaptureFormat.RAW) {
                     CaptureRequest.NOISE_REDUCTION_MODE_FAST
                 } else {
@@ -359,6 +358,7 @@ class FreshCameraEngine(
                                     brightnessBoost = snapshot.brightnessBoost,
                                     aiMode = snapshot.aiMode,
                                     isTeleLens = snapshot.activeLens == LensType.TELE_50MP,
+                                    displayZoom = snapshot.displayZoom,
                                     lensZoomRatio = snapshot.lensZoomRatio,
                                     superResEnabled = snapshot.neuralSuperResEnabled,
                                     postSavePolish = snapshot.postSavePolishEnabled
@@ -367,7 +367,8 @@ class FreshCameraEngine(
 
                             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
                             val zoomTag = "${String.format(Locale.US, "%.1f", snapshot.displayZoom)}x"
-                            val name = "FreshCam_${snapshot.profile.id}_${zoomTag}_$stamp.jpg"
+                            val aiTag = if (snapshot.neuralSuperResEnabled) "_AI_${snapshot.aiMode.shortLabel}" else ""
+                            val name = "FreshCam_${snapshot.profile.id}_${zoomTag}${aiTag}_$stamp.jpg"
 
                             val values = ContentValues().apply {
                                 put(MediaStore.MediaColumns.DISPLAY_NAME, name)

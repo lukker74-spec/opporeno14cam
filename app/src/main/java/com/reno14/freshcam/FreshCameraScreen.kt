@@ -90,26 +90,14 @@ private enum class SheetPage {
     SETTINGS
 }
 
-/**
- * Mappa un valore di zoom unificato (0.6x .. 35x) sulla lente fisica ottimale dell'Oppo Reno 14
- * e calcola il fattore di zoom interno relativo a quella lente, evitando salti o blocchi
- * quando si trascina lo slider orizzontale.
- */
 private fun resolveLensAndRatio(displayZoom: Float, currentLens: LensType, maxTeleRatio: Float): Pair<LensType, Float> {
     if (currentLens == LensType.FRONT) {
         return LensType.FRONT to displayZoom.coerceIn(1.0f, 2.0f)
     }
     return when {
-        displayZoom < 0.95f -> {
-            // Ultra-grandangolo 0.6x -> ratio 1.0f sulla lente ultrawide
-            LensType.ULTRAWIDE to 1.0f
-        }
-        displayZoom < 3.45f -> {
-            // Principale 50MP da 1.0x fino a 3.4x
-            LensType.MAIN_50MP to displayZoom.coerceIn(1.0f, 3.45f)
-        }
+        displayZoom < 0.95f -> LensType.ULTRAWIDE to 1.0f
+        displayZoom < 3.45f -> LensType.MAIN_50MP to displayZoom.coerceIn(1.0f, 3.45f)
         else -> {
-            // Teleobiettivo ottico 3.5x (ratio = displayZoom / 3.5)
             val ratio = (displayZoom / 3.5f).coerceIn(1.0f, maxTeleRatio)
             LensType.TELE_50MP to ratio
         }
@@ -193,7 +181,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             previewView = pv,
             state = state,
             onZoomBounds = { _, maxZ ->
-                state = state.copy(maxLensZoomRatio = maxZ.coerceAtLeast(10.0f))
+                state = state.copy(maxLensZoomRatio = maxZ.coerceAtLeast(17.2f))
             },
             onBanner = { msg ->
                 state = state.copy(bannerMessage = msg)
@@ -268,7 +256,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // Top Bar con Flash, HDR, GPS, AI/SR e Profilo
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -320,7 +307,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
-                // Tasto rapido Posizione GPS ON / OFF
                 IconButton(
                     onClick = {
                         if (!state.locationTagEnabled) {
@@ -360,7 +346,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         )
                         .clickable {
                             val nextSr = !state.neuralSuperResEnabled
-                            val msg = if (nextSr) "AI Adattiva (Ottica + Zoom SR): ON" else "AI Adattiva: OFF"
+                            val msg = if (nextSr) "Rete Neurale AI: ON (${state.aiMode.shortLabel})" else "Rete Neurale AI: OFF"
                             state = state.copy(neuralSuperResEnabled = nextSr, bannerMessage = msg)
                         }
                         .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -371,6 +357,32 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         Text(
                             text = if (state.neuralSuperResEnabled) "AI: ON" else "AI: OFF",
                             color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                if (state.neuralSuperResEnabled) {
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(Color(0xFF1A2634).copy(alpha = 0.90f))
+                            .border(1.dp, Color(0xFF26C6DA), RoundedCornerShape(16.dp))
+                            .clickable {
+                                val nextLevel = when (state.aiMode) {
+                                    AiMode.LOW -> AiMode.MEDIUM
+                                    AiMode.MEDIUM -> AiMode.AGGRESSIVE
+                                    AiMode.AGGRESSIVE -> AiMode.LOW
+                                }
+                                state = state.copy(aiMode = nextLevel, bannerMessage = "Livello Rete Neurale: ${nextLevel.shortLabel}")
+                            }
+                            .padding(horizontal = 9.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = state.aiMode.shortLabel,
+                            color = Color(0xFF80DEEA),
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -467,10 +479,9 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 .padding(top = 8.dp, bottom = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Selettore orizzontale continuo unificato (0.6x -> 35x) con switch automatico lente
             if (state.activeLens != LensType.FRONT) {
-                val maxGlobalZoom = 3.5f * state.maxLensZoomRatio
-                val isOpticalPoint = state.lensZoomRatio <= 1.25f
+                val maxGlobalZoom = 60.0f
+                val maxTeleRatio = maxGlobalZoom / 3.5f
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -489,7 +500,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             val (resolvedLens, resolvedRatio) = resolveLensAndRatio(
                                 displayZoom = targetDisplay,
                                 currentLens = state.activeLens,
-                                maxTeleRatio = state.maxLensZoomRatio
+                                maxTeleRatio = maxTeleRatio
                             )
                             state = state.copy(
                                 displayZoom = targetDisplay,
@@ -504,8 +515,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         )
                     )
                     Text(
-                        text = if (isOpticalPoint) "OTTICO" else "AI SR",
-                        color = if (isOpticalPoint) Color(0xFF66BB6A) else Color(0xFF26C6DA),
+                        text = if (state.neuralSuperResEnabled) "NN ${state.aiMode.shortLabel.uppercase()}" else "AI OFF",
+                        color = if (state.neuralSuperResEnabled) Color(0xFF26C6DA) else Color.White.copy(alpha = 0.65f),
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(start = 6.dp)
@@ -518,8 +529,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 Pair("1x", 1.0f),
                 Pair("3.5x", 3.5f),
                 Pair("10x", 10.0f),
-                Pair("20x", 20.0f),
-                Pair("MAX", 3.5f * state.maxLensZoomRatio)
+                Pair("30x", 30.0f),
+                Pair("60x", 60.0f)
             )
             Row(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -537,7 +548,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                                 val (resolvedLens, resolvedRatio) = resolveLensAndRatio(
                                     displayZoom = targetDisplayZoom,
                                     currentLens = LensType.MAIN_50MP,
-                                    maxTeleRatio = state.maxLensZoomRatio
+                                    maxTeleRatio = 60.0f / 3.5f
                                 )
                                 state = state.copy(
                                     displayZoom = targetDisplayZoom,
@@ -572,7 +583,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                                         activeLens = LensType.TELE_50MP,
                                         displayZoom = 3.5f,
                                         lensZoomRatio = 1.0f,
-                                        bannerMessage = "Modalità Tele 50MP Ottico (3.5x)"
+                                        bannerMessage = "Modalità Tele 50MP (3.5x)"
                                     )
                                 } else {
                                     state = state.copy(shootingMode = mode, bannerMessage = "Modalità ${mode.label}")
@@ -780,14 +791,36 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 ) {
                     Text("Impostazioni Reno14 FreshCam", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Text(
-                        text = if (state.isNeuralModelReady) "Rete Neurale: ${state.loadedModelName} pronta per zoom spinti" else "Motore AI Adattivo pronto",
+                        text = if (state.isNeuralModelReady) "Rete Neurale: ${state.loadedModelName} attiva (1x → 60x)" else "Attenzione: file .tflite non rilevato",
                         fontSize = 12.sp,
-                        color = Color(0xFF4FC3F7)
+                        color = if (state.isNeuralModelReady) Color(0xFF4FC3F7) else Color(0xFFFF7043)
                     )
 
                     Spacer(modifier = Modifier.height(12.dp))
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(8.dp))
+
+                    ToggleRow(
+                        title = "Rete Neurale AI (ON / OFF)",
+                        subtitle = "Discreta su 1x, forte su zoom spinto fino a 60x con ancoraggio colori anti-artefatti",
+                        checked = state.neuralSuperResEnabled,
+                        onChange = { state = state.copy(neuralSuperResEnabled = it) }
+                    )
+
+                    if (state.neuralSuperResEnabled) {
+                        Text("Intensità Rete Neurale: ${state.aiMode.shortLabel}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF80DEEA))
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            AiMode.entries.forEach { mode ->
+                                FilterChip(
+                                    selected = state.aiMode == mode,
+                                    onClick = { state = state.copy(aiMode = mode) },
+                                    label = { Text(mode.shortLabel) }
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
 
                     ToggleRow(
                         title = "Informazioni di Posizione (GPS EXIF)",
@@ -805,13 +838,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                                 state = state.copy(locationTagEnabled = enable)
                             }
                         }
-                    )
-
-                    ToggleRow(
-                        title = "AI Adattiva (Ottica Pura + Ricostruzione Zoom)",
-                        subtitle = "Su zoom ottico preserva lente e sensore; su zoom spinto ricostruisce i dettagli reali",
-                        checked = state.neuralSuperResEnabled,
-                        onChange = { state = state.copy(neuralSuperResEnabled = it) }
                     )
 
                     ToggleRow(

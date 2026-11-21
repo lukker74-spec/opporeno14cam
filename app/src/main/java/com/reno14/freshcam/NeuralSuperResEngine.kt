@@ -22,17 +22,6 @@ data class NeuralProcessResult(
     val modeApplied: String
 )
 
-/**
- * Pipeline AI adattiva a due stadi per Oppo Reno 14:
- * - STADIO 1 (Zoom Ottico Nativo: 0.6x, 1x, 3.5x):
- *   Non applica alcuna ricostruzione sintetica ai pixel per non alterare la purezza dell'ottica;
- *   esegue solo bilanciamento dinamico fine e micro-contrasto ottico preservando la resa naturale
- *   di lente e sensore 50MP.
- * - STADIO 2 (Zoom Digitale Spinto / Molto Spinto: > 1.25x sulla lente attiva, es. 5x, 10x, 20x+):
- *   Applica prima una riduzione del rumore (chroma + luma edge-preserving) e poi ricostruisce
- *   i dettagli reali mediante la rete neurale Real-ESRGAN / QuickSRNet (con fallback direzionale
- *   su frequenze medie/alte senza inventare artefatti).
- */
 class NeuralSuperResEngine(private val context: Context) {
 
     private var interpreter: Interpreter? = null
@@ -68,7 +57,7 @@ class NeuralSuperResEngine(private val context: Context) {
             } catch (_: Exception) {
             }
         }
-        Log.w("NeuralSR", "Nessun modello .tflite trovato in assets, attivo motore adattivo")
+        Log.w("NeuralSR", "Nessun modello .tflite trovato in assets")
         return null
     }
 
@@ -79,6 +68,7 @@ class NeuralSuperResEngine(private val context: Context) {
         brightnessBoost: Float,
         aiMode: AiMode,
         isTeleLens: Boolean,
+        displayZoom: Float,
         lensZoomRatio: Float,
         superResEnabled: Boolean,
         postSavePolish: Boolean
@@ -91,7 +81,7 @@ class NeuralSuperResEngine(private val context: Context) {
 
         if (!superResEnabled) {
             if (postSavePolish) {
-                working = applyToneBalance(working, strength = 0.5f)
+                working = applyToneBalance(working, strength = 0.45f)
             }
             return NeuralProcessResult(
                 bitmap = working,
@@ -99,67 +89,83 @@ class NeuralSuperResEngine(private val context: Context) {
             )
         }
 
-        // Distingue tra zoom ottico nativo (lente pura <= 1.25x) e zoom digitale spinto (> 1.25x)
-        val isDigitalZoom = lensZoomRatio > 1.25f
-        val isHeavyDigitalZoom = lensZoomRatio >= 2.5f
+        val isZoomSpinto = displayZoom >= 8.0f || lensZoomRatio >= 2.2f
+        val isZoomEstremo = displayZoom >= 25.0f || lensZoomRatio >= 7.0f
 
-        if (!isDigitalZoom) {
-            // MODALITÀ OTTICA NATIVA (0.6x, 1x, 3.5x):
-            // Massima fedeltà all'ottica e al processore: nessuna alterazione neurale dei pixel,
-            // solo ottimizzazione tonale e micro-nitidezza ottica leggera.
-            val opticalPolished = if (postSavePolish) {
-                val toned = applyToneBalance(working, strength = 0.65f)
-                opticalMicroContrast(toned, amount = 0.14f)
-            } else {
-                opticalMicroContrast(working, amount = 0.10f)
-            }
-            return NeuralProcessResult(
-                bitmap = opticalPolished,
-                modeApplied = "Ottico Puro + ISP"
-            )
-        }
-
-        // MODALITÀ ZOOM SPINTO / MOLTO SPINTO (Digital crop > 1.25x, es. 5x, 10x, 20x, 35x):
-        // 1. Pre-pulizia del rumore sensore prima della ricostruzione dettagli
         val denoised = filterChromaAndLuma(
             bitmap = working,
-            chromaPasses = if (isHeavyDigitalZoom || isTeleLens) 2 else 1,
-            lumaPasses = if (isHeavyDigitalZoom) 2 else 1
+            chromaPasses = when {
+                isZoomEstremo -> 2
+                isZoomSpinto || isTeleLens -> 2
+                else -> 1
+            },
+            lumaPasses = when {
+                isZoomEstremo -> 2
+                isZoomSpinto && aiMode != AiMode.LOW -> 1
+                else -> 0
+            }
         )
 
         val tflite = getInterpreter()
-        var neuralDone = false
-        var reconstructed = denoised
+        var neuralUsed = false
+        var afterNeural = denoised
 
         if (tflite != null) {
             try {
-                reconstructed = runNeuralDetailReconstruction(
+                afterNeural = runNeuralReconstruction(
                     tflite = tflite,
                     cleanSource = denoised,
-                    heavyZoom = isHeavyDigitalZoom
+                    aiMode = aiMode,
+                    isTeleLens = isTeleLens,
+                    isZoomSpinto = isZoomSpinto,
+                    isZoomEstremo = isZoomEstremo
                 )
-                neuralDone = true
+                neuralUsed = true
             } catch (e: Exception) {
-                Log.e("NeuralSR", "Errore inferenza neurale, uso ricostruzione frequenze", e)
-                reconstructed = denoised
+                Log.e("NeuralSR", "Errore inferenza TFLite", e)
+                afterNeural = denoised
             }
         }
 
-        // 2. Ricostruzione conservativa dei bordi reali (senza inventare texture inesistenti)
-        val edgeGain = when {
-            isHeavyDigitalZoom && aiMode == AiMode.AGGRESSIVE -> 0.48f
-            isHeavyDigitalZoom -> 0.38f
-            else -> 0.28f
-        }
-        var finalBmp = conservativeDetailReconstruct(reconstructed, edgeGain)
-        if (postSavePolish) {
-            finalBmp = applyToneBalance(finalBmp, strength = 0.70f)
+        val detailGain = when {
+            isZoomEstremo -> when (aiMode) {
+                AiMode.LOW -> 0.55f
+                AiMode.MEDIUM -> 0.78f
+                AiMode.AGGRESSIVE -> 0.95f
+            }
+            isZoomSpinto -> when (aiMode) {
+                AiMode.LOW -> 0.42f
+                AiMode.MEDIUM -> 0.62f
+                AiMode.AGGRESSIVE -> 0.80f
+            }
+            isTeleLens -> when (aiMode) {
+                AiMode.LOW -> 0.25f
+                AiMode.MEDIUM -> 0.40f
+                AiMode.AGGRESSIVE -> 0.55f
+            }
+            else -> when (aiMode) {
+                AiMode.LOW -> 0.16f
+                AiMode.MEDIUM -> 0.26f
+                AiMode.AGGRESSIVE -> 0.36f
+            }
         }
 
-        val label = if (neuralDone) {
-            "Zoom AI Neurale (${loadedAssetName.removeSuffix(".tflite")})"
+        var finalBmp = guidedEdgeSharpen(afterNeural, detailGain, isZoomSpinto)
+        if (postSavePolish) {
+            val toneStrength = if (isZoomSpinto) 0.75f else 0.50f
+            finalBmp = applyToneBalance(finalBmp, strength = toneStrength)
+        }
+
+        val zoomTag = when {
+            isZoomEstremo -> "Zoom Estremo"
+            isZoomSpinto -> "Zoom Spinto"
+            isTeleLens -> "Tele"
+            else -> "1x"
+        }
+        val label = if (neuralUsed) {
+            "Rete Neurale ${aiMode.shortLabel} ($zoomTag)"
         } else {
-            "Zoom AI Ricostruzione Dettagli"
+            "AI ${aiMode.shortLabel} ($zoomTag · senza .tflite)"
         }
 
         return NeuralProcessResult(
@@ -168,15 +174,13 @@ class NeuralSuperResEngine(private val context: Context) {
         )
     }
 
-    /**
-     * Esegue inferenza neurale su patch ad alta risoluzione e fonde solo la componente di dettaglio
-     * (high-frequency residual) sull'immagine denoisata, impedendo alla rete di inventare
-     * texture artificiali o alterare colori e luminanza.
-     */
-    private fun runNeuralDetailReconstruction(
+    private fun runNeuralReconstruction(
         tflite: Interpreter,
         cleanSource: Bitmap,
-        heavyZoom: Boolean
+        aiMode: AiMode,
+        isTeleLens: Boolean,
+        isZoomSpinto: Boolean,
+        isZoomEstremo: Boolean
     ): Bitmap {
         val inTensor = tflite.getInputTensor(0)
         val outTensor = tflite.getOutputTensor(0)
@@ -190,19 +194,16 @@ class NeuralSuperResEngine(private val context: Context) {
         val outH = if (outShape.size == 4 && outShape[1] > 0) outShape[1] else inH * 4
         val outW = if (outShape.size == 4 && outShape[2] > 0) outShape[2] else inW * 4
 
-        val result = cleanSource.copy(Bitmap.Config.ARGB_8888, true)
-        val canvas = Canvas(result)
+        val workMaxSide = if (isZoomSpinto) 2400 else 3200
+        val workBase = scaleToMaxSide(cleanSource, workMaxSide)
+        val neuralCanvasBmp = workBase.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(neuralCanvasBmp)
 
-        val ratio = if (heavyZoom) 0.55f else 0.45f
-        val regionW = (cleanSource.width * ratio).toInt().coerceAtLeast(inW * 3).coerceAtMost(cleanSource.width)
-        val regionH = (cleanSource.height * ratio).toInt().coerceAtLeast(inH * 3).coerceAtMost(cleanSource.height)
+        val cols = if (isZoomSpinto) 6 else 4
+        val rows = if (isZoomSpinto) 6 else 4
 
-        val startX = (cleanSource.width - regionW) / 2
-        val startY = (cleanSource.height - regionH) / 2
-        val cols = 3
-        val rows = 3
-        val cellW = regionW / cols
-        val cellH = regionH / rows
+        val cellW = workBase.width / cols
+        val cellH = workBase.height / rows
 
         val bytesPerChannelIn = if (inType == DataType.UINT8) 1 else 4
         val bytesPerChannelOut = if (outType == DataType.UINT8) 1 else 4
@@ -212,22 +213,26 @@ class NeuralSuperResEngine(private val context: Context) {
         val tilePixels = IntArray(inW * inH)
         val outPixels = IntArray(outW * outH)
 
-        // Fusione dosata: estrae solo la nitidezza strutturale senza sovrascrivere i colori naturali
-        val blendPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-            alpha = if (heavyZoom) 110 else 85
-        }
+        val tilePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        val overlapX = (cellW * 0.12f).toInt()
+        val overlapY = (cellH * 0.12f).toInt()
 
         for (r in 0 until rows) {
             for (c in 0 until cols) {
-                val left = startX + c * cellW
-                val top = startY + r * cellH
-                val right = if (c == cols - 1) startX + regionW else left + cellW
-                val bottom = if (r == rows - 1) startY + regionH else top + cellH
+                val baseLeft = c * cellW
+                val baseTop = r * cellH
+                val baseRight = if (c == cols - 1) workBase.width else baseLeft + cellW
+                val baseBottom = if (r == rows - 1) workBase.height else baseTop + cellH
 
-                val cw = (right - left).coerceAtLeast(1)
-                val ch = (bottom - top).coerceAtLeast(1)
+                val srcLeft = (baseLeft - overlapX).coerceAtLeast(0)
+                val srcTop = (baseTop - overlapY).coerceAtLeast(0)
+                val srcRight = (baseRight + overlapX).coerceAtMost(workBase.width)
+                val srcBottom = (baseBottom + overlapY).coerceAtMost(workBase.height)
 
-                val crop = Bitmap.createBitmap(cleanSource, left, top, cw, ch)
+                val cw = (srcRight - srcLeft).coerceAtLeast(1)
+                val ch = (srcBottom - srcTop).coerceAtLeast(1)
+
+                val crop = Bitmap.createBitmap(workBase, srcLeft, srcTop, cw, ch)
                 val scaledIn = Bitmap.createScaledBitmap(crop, inW, inH, true)
                 scaledIn.getPixels(tilePixels, 0, inW, 0, 0, inW, inH)
 
@@ -239,7 +244,6 @@ class NeuralSuperResEngine(private val context: Context) {
                         inputBuffer.put((p and 0xFF).toByte())
                     }
                 } else {
-                    // Normalizza automaticamente tra [0..1] per Real-ESRGAN/QuickSRNet o [0..255] per ESRGAN-TF2
                     val scaleIn = if (loadedAssetName == "superres.tflite" && inH >= 64) 1f / 255f else 1f
                     for (p in tilePixels) {
                         inputBuffer.putFloat(((p ushr 16) and 0xFF) * scaleIn)
@@ -273,54 +277,106 @@ class NeuralSuperResEngine(private val context: Context) {
                 val srPatch = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
                 srPatch.setPixels(outPixels, 0, outW, 0, 0, outW, outH)
 
-                canvas.drawBitmap(srPatch, null, Rect(left, top, right, bottom), blendPaint)
+                canvas.drawBitmap(srPatch, null, Rect(srcLeft, srcTop, srcRight, srcBottom), tilePaint)
             }
         }
 
-        return result
+        val fullNeural = if (neuralCanvasBmp.width != cleanSource.width || neuralCanvasBmp.height != cleanSource.height) {
+            Bitmap.createScaledBitmap(neuralCanvasBmp, cleanSource.width, cleanSource.height, true)
+        } else {
+            neuralCanvasBmp
+        }
+
+        val lumaWeight = when {
+            isZoomEstremo -> when (aiMode) {
+                AiMode.LOW -> 0.65f
+                AiMode.MEDIUM -> 0.82f
+                AiMode.AGGRESSIVE -> 0.92f
+            }
+            isZoomSpinto -> when (aiMode) {
+                AiMode.LOW -> 0.55f
+                AiMode.MEDIUM -> 0.72f
+                AiMode.AGGRESSIVE -> 0.85f
+            }
+            isTeleLens -> when (aiMode) {
+                AiMode.LOW -> 0.35f
+                AiMode.MEDIUM -> 0.50f
+                AiMode.AGGRESSIVE -> 0.65f
+            }
+            else -> when (aiMode) {
+                AiMode.LOW -> 0.22f
+                AiMode.MEDIUM -> 0.32f
+                AiMode.AGGRESSIVE -> 0.42f
+            }
+        }
+
+        return fuseNeuralStructureWithRealColor(cleanSource, fullNeural, lumaWeight)
     }
 
-    private fun opticalMicroContrast(bitmap: Bitmap, amount: Float): Bitmap {
-        val w = bitmap.width
-        val h = bitmap.height
-        if (w * h > 24_000_000) return bitmap
-        val src = IntArray(w * h)
-        val dst = IntArray(w * h)
-        bitmap.getPixels(src, 0, w, 0, 0, w, h)
+    private fun fuseNeuralStructureWithRealColor(
+        original: Bitmap,
+        neural: Bitmap,
+        structureWeight: Float
+    ): Bitmap {
+        val w = original.width
+        val h = original.height
+        val origPx = IntArray(w * h)
+        val neurPx = IntArray(w * h)
+        original.getPixels(origPx, 0, w, 0, 0, w, h)
+        neural.getPixels(neurPx, 0, w, 0, 0, w, h)
 
-        for (y in 1 until h - 1) {
-            val row = y * w
-            for (x in 1 until w - 1) {
-                val idx = row + x
-                val c = src[idx]
-                val cr = (c ushr 16) and 0xFF
-                val cg = (c ushr 8) and 0xFF
-                val cb = c and 0xFF
+        val invWeight = 1f - structureWeight
+        val chromaWeight = (structureWeight * 0.35f).coerceIn(0.08f, 0.32f)
+        val invChroma = 1f - chromaWeight
 
-                val n = src[idx - w]
-                val s = src[idx + w]
-                val e = src[idx + 1]
-                val west = src[idx - 1]
+        for (i in origPx.indices) {
+            val o = origPx[i]
+            val n = neurPx[i]
 
-                val avgR = (((n ushr 16) and 0xFF) + ((s ushr 16) and 0xFF) + ((e ushr 16) and 0xFF) + ((west ushr 16) and 0xFF)) / 4
-                val avgG = (((n ushr 8) and 0xFF) + ((s ushr 8) and 0xFF) + ((e ushr 8) and 0xFF) + ((west ushr 8) and 0xFF)) / 4
-                val avgB = ((n and 0xFF) + (s and 0xFF) + (e and 0xFF) + (west and 0xFF)) / 4
+            val or = (o ushr 16) and 0xFF
+            val og = (o ushr 8) and 0xFF
+            val ob = o and 0xFF
 
-                val dR = cr - avgR
-                val dG = cg - avgG
-                val dB = cb - avgB
+            val nr = (n ushr 16) and 0xFF
+            val ng = (n ushr 8) and 0xFF
+            val nb = n and 0xFF
 
-                val outR = if (abs(dR) in 4..45) (cr + dR * amount).toInt().coerceIn(0, 255) else cr
-                val outG = if (abs(dG) in 4..45) (cg + dG * amount).toInt().coerceIn(0, 255) else cg
-                val outB = if (abs(dB) in 4..45) (cb + dB * amount).toInt().coerceIn(0, 255) else cb
+            val yOrig = 0.299f * or + 0.587f * og + 0.114f * ob
+            val yNeur = 0.299f * nr + 0.587f * ng + 0.114f * nb
 
-                dst[idx] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
-            }
+            val clampedYNeur = yNeur.coerceIn(yOrig - 42f, yOrig + 42f)
+            val yFused = yOrig * invWeight + clampedYNeur * structureWeight
+
+            val uOrig = ob - yOrig
+            val vOrig = or - yOrig
+            val uNeur = nb - yNeur
+            val vNeur = nr - yNeur
+
+            val uFused = uOrig * invChroma + uNeur * chromaWeight
+            val vFused = vOrig * invChroma + vNeur * chromaWeight
+
+            val outR = (yFused + vFused).toInt().coerceIn(0, 255)
+            val outB = (yFused + uFused).toInt().coerceIn(0, 255)
+            val outG = ((yFused - 0.299f * outR - 0.114f * outB) / 0.587f).toInt().coerceIn(0, 255)
+
+            origPx[i] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
         }
-        copyBorders(src, dst, w, h)
+
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(dst, 0, w, 0, 0, w, h)
+        out.setPixels(origPx, 0, w, 0, 0, w, h)
         return out
+    }
+
+    private fun scaleToMaxSide(bmp: Bitmap, maxSide: Int): Bitmap {
+        val longest = max(bmp.width, bmp.height)
+        if (longest <= maxSide) return bmp
+        val scale = maxSide.toFloat() / longest.toFloat()
+        return Bitmap.createScaledBitmap(
+            bmp,
+            (bmp.width * scale).toInt().coerceAtLeast(1),
+            (bmp.height * scale).toInt().coerceAtLeast(1),
+            true
+        )
     }
 
     private fun filterChromaAndLuma(bitmap: Bitmap, chromaPasses: Int, lumaPasses: Int): Bitmap {
@@ -392,7 +448,7 @@ class NeuralSuperResEngine(private val context: Context) {
                         val nr = (n ushr 16) and 0xFF
                         val ng = (n ushr 8) and 0xFF
                         val nb = n and 0xFF
-                        if ((abs(cr - nr) + abs(cg - ng) + abs(cb - nb)) / 3 < 22) {
+                        if ((abs(cr - nr) + abs(cg - ng) + abs(cb - nb)) / 3 < 20) {
                             sumR += nr
                             sumG += ng
                             sumB += nb
@@ -414,7 +470,7 @@ class NeuralSuperResEngine(private val context: Context) {
         return out
     }
 
-    private fun conservativeDetailReconstruct(bitmap: Bitmap, gain: Float): Bitmap {
+    private fun guidedEdgeSharpen(bitmap: Bitmap, gain: Float, isZoomSpinto: Boolean): Bitmap {
         val w = bitmap.width
         val h = bitmap.height
         if (w * h > 24_000_000) return bitmap
@@ -422,6 +478,8 @@ class NeuralSuperResEngine(private val context: Context) {
         val src = IntArray(w * h)
         val dst = IntArray(w * h)
         bitmap.getPixels(src, 0, w, 0, 0, w, h)
+
+        val edgeThreshold = if (isZoomSpinto) 4 else 5
 
         for (y in 1 until h - 1) {
             val row = y * w
@@ -465,10 +523,9 @@ class NeuralSuperResEngine(private val context: Context) {
                 val hfG = cg - avgG
                 val hfB = cb - avgB
 
-                // Interviene solo su contorni reali (soglia > 5) evitando di inventare grana nelle aree uniformi
-                val outR = if (abs(hfR) > 5) ((cr * 0.78f + dirR * 0.22f) + hfR * gain).toInt().coerceIn(0, 255) else cr
-                val outG = if (abs(hfG) > 5) ((cg * 0.78f + dirG * 0.22f) + hfG * gain).toInt().coerceIn(0, 255) else cg
-                val outB = if (abs(hfB) > 5) ((cb * 0.78f + dirB * 0.22f) + hfB * gain).toInt().coerceIn(0, 255) else cb
+                val outR = if (abs(hfR) > edgeThreshold) ((cr * 0.76f + dirR * 0.24f) + hfR * gain).toInt().coerceIn(0, 255) else cr
+                val outG = if (abs(hfG) > edgeThreshold) ((cg * 0.76f + dirG * 0.24f) + hfG * gain).toInt().coerceIn(0, 255) else cg
+                val outB = if (abs(hfB) > edgeThreshold) ((cb * 0.76f + dirB * 0.24f) + hfB * gain).toInt().coerceIn(0, 255) else cb
 
                 dst[idx] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
             }
@@ -486,8 +543,8 @@ class NeuralSuperResEngine(private val context: Context) {
         val pixels = IntArray(w * h)
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        val curve = 0.045 * strength
-        val lift = 8.0 * strength
+        val curve = 0.05 * strength
+        val lift = 9.0 * strength
 
         val lut = IntArray(256)
         for (v in 0..255) {

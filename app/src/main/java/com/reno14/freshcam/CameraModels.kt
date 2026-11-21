@@ -133,9 +133,9 @@ enum class CameraProfile(
 }
 
 enum class AiMode(val label: String, val shortLabel: String) {
-    LOW("AI Bassa", "AI Bassa"),
-    MEDIUM("AI Media", "AI Media"),
-    AGGRESSIVE("AI Aggressiva", "AI Alta")
+    LOW("AI Basso", "Basso"),
+    MEDIUM("AI Media", "Medio"),
+    AGGRESSIVE("AI Alto", "Alto")
 }
 
 enum class CaptureFormat(val label: String, val badge: String) {
@@ -196,11 +196,9 @@ data class FreshCamState(
     val shootingMode: ShootingMode = ShootingMode.PHOTO,
     val flashMode: FlashMode = FlashMode.AUTO,
     val hdrMode: HdrMode = HdrMode.NATURAL,
-    // Zoom unificato per display (0.6x = ultrawide, 1.0x = main, 3.5x..35x = tele)
     val displayZoom: Float = 1.0f,
-    // Zoom interno relativo alla lente attiva (1.0f = focale nativa della lente selezionata)
     val lensZoomRatio: Float = 1.0f,
-    val maxLensZoomRatio: Float = 10.0f,
+    val maxLensZoomRatio: Float = 17.2f,
     val brightnessBoost: Float = 0.08f,
     val evCompensation: Int = 1,
     val profileIntensity: Float = 1.0f,
