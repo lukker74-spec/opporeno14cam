@@ -1,3 +1,3 @@
-# Reno14 FreshCam v2.0.1
+# Reno14 FreshCam v3.0 (Rete Neurale ESRGAN Reale)
 
-Corretti gli errori di compilazione Kotlin su `CameraModels.kt` e `GenerativeSuperResEngine.kt` (rimosso il riferimento non risolto a `litert` / `Interpreter` e allineati i parametri di `LensType`).
+Integra TensorFlow Lite (`org.tensorflow:tensorflow-lite:2.16.1`) e scarica automaticamente il modello neurale `esrgan.tflite` in fase di build su GitHub Actions. Quando `SR: ON` è attivo, esegue inferenza neurale reale ESRGAN a tasselli sull'area centrale dell'immagine salvata.

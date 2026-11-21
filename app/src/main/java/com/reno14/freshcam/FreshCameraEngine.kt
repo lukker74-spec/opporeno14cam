@@ -25,6 +25,8 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.ResolutionSelector
+import androidx.camera.core.ResolutionStrategy
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.MediaStoreOutputOptions
@@ -56,12 +58,14 @@ class FreshCameraEngine(
     private var camera: Camera? = null
 
     private val saveWorker = Executors.newSingleThreadExecutor()
-    private val superResEngine = GenerativeSuperResEngine(context)
+    private val neuralEngine = NeuralSuperResEngine(context)
 
     var minFocusDistanceDiopters: Float = 0f
         private set
 
     private var discoveredLenses: List<PhysicalLensInfo> = emptyList()
+
+    fun checkNeuralModelReady(): Boolean = neuralEngine.isModelAvailable()
 
     fun discoverLenses(): List<PhysicalLensInfo> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -132,8 +136,13 @@ class FreshCameraEngine(
                 cameraProvider = provider
 
                 val previewBuilder = Preview.Builder()
+                val resSelector = ResolutionSelector.Builder()
+                    .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                    .build()
                 val captureBuilder = ImageCapture.Builder()
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .setResolutionSelector(resSelector)
+                    .setJpegQuality(99)
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
 
                 val pExt = Camera2Interop.Extender(previewBuilder)
                 val cExt = Camera2Interop.Extender(captureBuilder)
@@ -302,30 +311,31 @@ class FreshCameraEngine(
                     saveWorker.execute {
                         try {
                             val rotated = rotate(bmp, deg)
-                            val capped = capSize(rotated, 3600)
+                            val capped = capSize(rotated, 4800)
 
-                            val processed = if (snapshot.captureFormat == CaptureFormat.RAW) {
-                                snapshot.profile.applyToBitmap(
-                                    source = capped,
-                                    strength = 0.0f,
-                                    brightnessBoost = snapshot.brightnessBoost
+                            val outcome = if (snapshot.captureFormat == CaptureFormat.RAW) {
+                                NeuralProcessResult(
+                                    bitmap = snapshot.profile.applyToBitmap(
+                                        source = capped,
+                                        strength = 0.0f,
+                                        brightnessBoost = snapshot.brightnessBoost
+                                    ),
+                                    neuralApplied = false,
+                                    detailNote = "RAW"
                                 )
                             } else {
-                                superResEngine.process(
+                                neuralEngine.process(
                                     source = capped,
                                     profile = snapshot.profile,
                                     profileIntensity = snapshot.profileIntensity,
                                     brightnessBoost = snapshot.brightnessBoost,
-                                    aiMode = snapshot.aiMode,
-                                    isTeleLens = snapshot.activeLens == LensType.TELE_50MP,
-                                    zoomRatio = snapshot.zoomRatio,
-                                    superResEnabled = snapshot.generativeSuperResEnabled,
+                                    superResEnabled = snapshot.neuralSuperResEnabled,
                                     postSavePolish = snapshot.postSavePolishEnabled
                                 )
                             }
 
                             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
-                            val srTag = if (snapshot.generativeSuperResEnabled && snapshot.captureFormat != CaptureFormat.RAW) "_SR" else ""
+                            val srTag = if (outcome.neuralApplied) "_ESRGAN" else ""
                             val name = "FreshCam_${snapshot.profile.id}_${snapshot.activeLens.name.lowercase()}${srTag}_$stamp.jpg"
 
                             val values = ContentValues().apply {
@@ -339,11 +349,10 @@ class FreshCameraEngine(
                             val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                             if (uri != null) {
                                 context.contentResolver.openOutputStream(uri)?.use { out ->
-                                    processed.compress(Bitmap.CompressFormat.JPEG, 94, out)
+                                    outcome.bitmap.compress(Bitmap.CompressFormat.JPEG, 98, out)
                                 }
                                 ContextCompat.getMainExecutor(context).execute {
-                                    val srLabel = if (snapshot.generativeSuperResEnabled && snapshot.captureFormat != CaptureFormat.RAW) " · Super-Res ON" else ""
-                                    onResult(uri.toString(), "Salvata$srLabel: $name")
+                                    onResult(uri.toString(), "Salvata (${outcome.detailNote})")
                                 }
                             } else {
                                 ContextCompat.getMainExecutor(context).execute {
@@ -438,7 +447,7 @@ class FreshCameraEngine(
 
         val yuv = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
         val out = ByteArrayOutputStream()
-        yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 94, out)
+        yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 98, out)
         val bytes = out.toByteArray()
         return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }

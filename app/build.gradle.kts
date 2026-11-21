@@ -12,8 +12,8 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "2.0.1-sr-toggle"
+        versionCode = 5
+        versionName = "3.0.0-neural-sr"
     }
 
     buildTypes {
@@ -38,6 +38,10 @@ android {
     buildFeatures {
         compose = true
     }
+
+    androidResources {
+        noCompress += "tflite"
+    }
 }
 
 dependencies {
@@ -49,6 +53,8 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
 
     val cameraxVersion = "1.4.1"
     implementation("androidx.camera:camera-core:$cameraxVersion")

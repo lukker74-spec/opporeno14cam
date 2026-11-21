@@ -95,12 +95,14 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
     val engine = remember(context, lifecycleOwner) { FreshCameraEngine(context, lifecycleOwner) }
 
     LaunchedEffect(Unit) {
-        state = state.copy(detectedLenses = engine.discoverLenses())
+        val lenses = engine.discoverLenses()
+        val hasModel = engine.checkNeuralModelReady()
+        state = state.copy(detectedLenses = lenses, isNeuralModelReady = hasModel)
     }
 
     LaunchedEffect(state.bannerMessage) {
         if (state.bannerMessage != null) {
-            delay(2200)
+            delay(2500)
             state = state.copy(bannerMessage = null)
         }
     }
@@ -213,7 +215,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // Top Bar
+        // Top Bar con tasto SR: ON / OFF per la rete neurale ESRGAN
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -265,62 +267,40 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
+                // Tasto ON / OFF Rete Neurale Super-Resolution (ESRGAN)
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
                         .background(
-                            if (state.generativeSuperResEnabled) Color(0xFF00ACC1).copy(alpha = 0.88f)
+                            if (state.neuralSuperResEnabled) Color(0xFF00ACC1).copy(alpha = 0.90f)
                             else Color.Black.copy(alpha = 0.65f)
                         )
                         .border(
                             1.dp,
-                            if (state.generativeSuperResEnabled) Color.White else Color.White.copy(alpha = 0.35f),
+                            if (state.neuralSuperResEnabled) Color.White else Color.White.copy(alpha = 0.35f),
                             RoundedCornerShape(16.dp)
                         )
                         .clickable {
-                            val nextSr = !state.generativeSuperResEnabled
-                            state = state.copy(
-                                generativeSuperResEnabled = nextSr,
-                                bannerMessage = if (nextSr) "Super-Resolution ATTIVA" else "Super-Resolution DISATTIVATA"
-                            )
-                        }
-                        .padding(horizontal = 10.dp, vertical = 6.dp)
-                ) {
-                    Text(
-                        text = if (state.generativeSuperResEnabled) "SR: ON" else "SR: OFF",
-                        color = Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
-                Spacer(modifier = Modifier.width(6.dp))
-
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(
-                            when (state.aiMode) {
-                                AiMode.LOW -> Color.Black.copy(alpha = 0.65f)
-                                AiMode.MEDIUM -> Color(0xFF00838F).copy(alpha = 0.80f)
-                                AiMode.AGGRESSIVE -> Color(0xFFD84315).copy(alpha = 0.88f)
+                            val nextSr = !state.neuralSuperResEnabled
+                            val msg = if (nextSr) {
+                                if (state.isNeuralModelReady) "Rete Neurale ESRGAN: ON"
+                                else "SR: ON (attesa modello esrgan.tflite)"
+                            } else {
+                                "Rete Neurale ESRGAN: OFF"
                             }
-                        )
-                        .border(1.dp, Color.White.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
-                        .clickable {
-                            val next = when (state.aiMode) {
-                                AiMode.LOW -> AiMode.MEDIUM
-                                AiMode.MEDIUM -> AiMode.AGGRESSIVE
-                                AiMode.AGGRESSIVE -> AiMode.LOW
-                            }
-                            state = state.copy(aiMode = next, bannerMessage = next.label)
+                            state = state.copy(neuralSuperResEnabled = nextSr, bannerMessage = msg)
                         }
                         .padding(horizontal = 10.dp, vertical = 6.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text(state.aiMode.shortLabel, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = if (state.neuralSuperResEnabled) "SR: ON" else "SR: OFF",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
 
@@ -679,17 +659,21 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
                     Text("Impostazioni Reno14 FreshCam", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                    Text("Super-Resolution a scelta · Scatto istantaneo", fontSize = 12.sp, color = Color(0xFF4FC3F7))
+                    Text(
+                        text = if (state.isNeuralModelReady) "Modello Neurale ESRGAN (.tflite): CARICATO" else "Modello Neurale ESRGAN (.tflite): NON TROVATO",
+                        fontSize = 12.sp,
+                        color = if (state.isNeuralModelReady) Color(0xFF66BB6A) else Color(0xFFFF7043)
+                    )
 
                     Spacer(modifier = Modifier.height(12.dp))
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(8.dp))
 
                     ToggleRow(
-                        title = "Super-Resolution per Zoom Spinto (a scelta)",
-                        subtitle = "Sintesi direzionale dei bordi e micro-dettaglio sul Tele 50MP",
-                        checked = state.generativeSuperResEnabled,
-                        onChange = { state = state.copy(generativeSuperResEnabled = it) }
+                        title = "Rete Neurale ESRGAN Super-Resolution (ON / OFF)",
+                        subtitle = "Esegue inferenza neurale reale TensorFlow Lite sull'area centrale dell'immagine",
+                        checked = state.neuralSuperResEnabled,
+                        onChange = { state = state.copy(neuralSuperResEnabled = it) }
                     )
 
                     ToggleRow(
