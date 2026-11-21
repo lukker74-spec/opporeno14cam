@@ -72,6 +72,7 @@ class FreshCameraEngine(
 
     fun checkNeuralModelReady(): Boolean = neuralEngine.isModelAvailable()
     fun getLoadedModelName(): String = neuralEngine.loadedAssetName
+    fun getActiveAccelerator(): String = neuralEngine.acceleratorName
 
     fun discoverLenses(): List<PhysicalLensInfo> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -316,11 +317,13 @@ class FreshCameraEngine(
     }
 
     /**
-     * Cattura 3 scatti in sequenza rapida quando AI: ON è attivo (riducendo la risoluzione massima
-     * a 3200px in RAM per evitare qualsiasi OutOfMemoryError su Android).
+     * Scatto adattivo per MediaTek:
+     * - Su foto normali 1x con AI: ON scatta 1 fotogramma + NNAPI veloce (salvataggio quasi istantaneo).
+     * - Su zoom spinto (8x-60x) o AI Alto scatta una raffica di 3 fotogrammi allineati + NNAPI + Cloud opzionale.
      */
     fun shootInstant(
         snapshot: FreshCamState,
+        onStatus: (String) -> Unit,
         onResult: (uriString: String?, message: String) -> Unit
     ) {
         val cap = imageCapture ?: run {
@@ -329,9 +332,14 @@ class FreshCameraEngine(
         }
 
         val capturedLocation = if (snapshot.locationTagEnabled) getLastKnownLocation() else null
-        val burstCount = if (snapshot.neuralSuperResEnabled && snapshot.captureFormat != CaptureFormat.RAW) 3 else 1
+        val isZoomSpinto = snapshot.displayZoom >= 8.0f || snapshot.lensZoomRatio >= 2.2f
+        val burstCount = if (snapshot.neuralSuperResEnabled && snapshot.captureFormat != CaptureFormat.RAW && (isZoomSpinto || snapshot.aiMode == AiMode.AGGRESSIVE)) 3 else 1
         val maxSide = if (snapshot.neuralSuperResEnabled) 3200 else 4200
         val collectedFrames = mutableListOf<Bitmap>()
+
+        if (snapshot.neuralSuperResEnabled) {
+            onStatus(if (burstCount > 1) "Elaborazione Burst ${burstCount}x + AI..." else "Elaborazione AI in corso...")
+        }
 
         fun captureNextFrame(remaining: Int) {
             cap.takePicture(
@@ -413,7 +421,6 @@ class FreshCameraEngine(
                     )
                 }
 
-                // Libera subito i frame sorgente per risparmiare memoria
                 frames.forEach { if (!it.isRecycled && it !== outcome.bitmap) it.recycle() }
 
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
@@ -449,7 +456,7 @@ class FreshCameraEngine(
                     }
                     val gpsNote = if (capturedLocation != null) " · GPS" else ""
                     ContextCompat.getMainExecutor(context).execute {
-                        onResult(uri.toString(), "Salvata (${outcome.modeApplied}$gpsNote)")
+                        onResult(uri.toString(), "Salvata: ${outcome.modeApplied}$gpsNote")
                     }
                 } else {
                     if (!outcome.bitmap.isRecycled) outcome.bitmap.recycle()

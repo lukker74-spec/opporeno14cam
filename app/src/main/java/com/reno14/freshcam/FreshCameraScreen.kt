@@ -141,13 +141,14 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             detectedLenses = lenses,
             isNeuralModelReady = hasModel,
             loadedModelName = engine.getLoadedModelName(),
+            activeAccelerator = engine.getActiveAccelerator(),
             hasLocationPermission = hasLoc
         )
     }
 
     LaunchedEffect(state.bannerMessage) {
         if (state.bannerMessage != null) {
-            delay(2500)
+            delay(4000)
             state = state.copy(bannerMessage = null)
         }
     }
@@ -350,7 +351,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         )
                         .clickable {
                             val nextSr = !state.neuralSuperResEnabled
-                            val msg = if (nextSr) "Burst + Rete Neurale: ON (${state.aiMode.shortLabel})" else "AI: OFF"
+                            val msg = if (nextSr) "AI MediaTek: ON (${state.aiMode.shortLabel})" else "AI: OFF"
                             state = state.copy(neuralSuperResEnabled = nextSr, bannerMessage = msg)
                         }
                         .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -407,8 +408,13 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             )
                             .clickable {
                                 val nextCloud = !state.cloudAiEnabled
-                                val msg = if (nextCloud) "Cloud AI Generativa: ON" else "Cloud AI: OFF"
-                                state = state.copy(cloudAiEnabled = nextCloud, bannerMessage = msg)
+                                if (nextCloud && state.cloudApiKey.isBlank()) {
+                                    state = state.copy(cloudAiEnabled = true, bannerMessage = "Inserisci il Token HF nelle Impostazioni")
+                                    sheet = SheetPage.SETTINGS
+                                } else {
+                                    val msg = if (nextCloud) "Cloud AI: ON" else "Cloud AI: OFF"
+                                    state = state.copy(cloudAiEnabled = nextCloud, bannerMessage = msg)
+                                }
                             }
                             .padding(horizontal = 8.dp, vertical = 6.dp)
                     ) {
@@ -465,6 +471,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
+        // Banner di stato ben visibile (sia durante l'elaborazione AI sia al salvataggio)
+        val activeStatusText = state.persistentStatus ?: state.bannerMessage
         if (state.isSubjectLocked) {
             Box(
                 modifier = Modifier
@@ -486,19 +494,18 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     Text("Oggetto bloccato · Tocca per sbloccare", color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
             }
-        } else {
-            state.bannerMessage?.let { msg ->
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .statusBarsPadding()
-                        .padding(top = 58.dp)
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(Color.Black.copy(alpha = 0.78f))
-                        .padding(horizontal = 14.dp, vertical = 6.dp)
-                ) {
-                    Text(msg, color = Color.White, fontSize = 12.sp)
-                }
+        } else if (activeStatusText != null) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 58.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color(0xFF0E1621).copy(alpha = 0.90f))
+                    .border(1.dp, Color(0xFF26C6DA).copy(alpha = 0.65f), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+            ) {
+                Text(activeStatusText, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             }
         }
 
@@ -547,7 +554,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         )
                     )
                     Text(
-                        text = if (state.neuralSuperResEnabled) "BURST+NN" else "AI OFF",
+                        text = if (state.neuralSuperResEnabled) "NNAPI" else "AI OFF",
                         color = if (state.neuralSuperResEnabled) Color(0xFF26C6DA) else Color.White.copy(alpha = 0.65f),
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
@@ -672,12 +679,19 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             } else {
                                 flashPulse = true
                                 val snap = state
-                                engine.shootInstant(snap) { uri, msg ->
-                                    state = state.copy(
-                                        lastCapturedUri = uri ?: state.lastCapturedUri,
-                                        bannerMessage = msg
-                                    )
-                                }
+                                engine.shootInstant(
+                                    snapshot = snap,
+                                    onStatus = { busyMsg ->
+                                        state = state.copy(persistentStatus = busyMsg)
+                                    },
+                                    onResult = { uri, msg ->
+                                        state = state.copy(
+                                            persistentStatus = null,
+                                            lastCapturedUri = uri ?: state.lastCapturedUri,
+                                            bannerMessage = msg
+                                        )
+                                    }
+                                )
                             }
                         },
                     contentAlignment = Alignment.Center
@@ -826,7 +840,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 ) {
                     Text("Impostazioni Reno14 FreshCam", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Text(
-                        text = if (state.isNeuralModelReady) "Motore: Multi-Frame Burst + ${state.loadedModelName} (Residuale)" else "Motore: Multi-Frame Burst 3x attivo",
+                        text = if (state.isNeuralModelReady) "Acceleratore: ${state.activeAccelerator} (${state.loadedModelName})" else "Motore AI locale attivo",
                         fontSize = 12.sp,
                         color = Color(0xFF4FC3F7)
                     )
@@ -836,8 +850,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     Spacer(modifier = Modifier.height(8.dp))
 
                     ToggleRow(
-                        title = "AI Locale (Multi-Frame Burst + Rete Neurale)",
-                        subtitle = "Fonde 3 scatti allineati e inietta solo dettagli neurali ad alta frequenza senza impastare",
+                        title = "AI Locale Ottimizzata MediaTek (NNAPI)",
+                        subtitle = "Leggera e naturale a 1x, più spinta e mirata sul soggetto allo zoom 8x–60x",
                         checked = state.neuralSuperResEnabled,
                         onChange = { state = state.copy(neuralSuperResEnabled = it) }
                     )
@@ -859,7 +873,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                     ToggleRow(
                         title = "AI Generativa in Cloud (Opzionale)",
-                        subtitle = "Invia il ritaglio centrale dello zoom spinto a Swin2SR/Diffusion Cloud per ricostruzione avanzata",
+                        subtitle = "Richiede un Token gratuito Hugging Face (hf_...). Mostra l'esito nel banner di salvataggio",
                         checked = state.cloudAiEnabled,
                         onChange = { state = state.copy(cloudAiEnabled = it) }
                     )
@@ -875,7 +889,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         OutlinedTextField(
                             value = state.cloudEndpointUrl,
                             onValueChange = { state = state.copy(cloudEndpointUrl = it) },
-                            label = { Text("URL Modello Cloud SR") },
+                            label = { Text("URL Endpoint Cloud SR") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                         )
@@ -902,7 +916,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                     ToggleRow(
                         title = "Ottimizzazione al Salvataggio (disattivabile)",
-                        subtitle = "Bilancia ombre e alte luci in background senza bloccare lo scatto",
+                        subtitle = "Bilancia ombre e alte luci in background",
                         checked = state.postSavePolishEnabled,
                         onChange = { state = state.copy(postSavePolishEnabled = it) }
                     )

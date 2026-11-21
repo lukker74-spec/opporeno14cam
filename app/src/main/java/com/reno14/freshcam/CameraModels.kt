@@ -208,14 +208,16 @@ data class FreshCamState(
     val neuralSuperResEnabled: Boolean = true,
     val cloudAiEnabled: Boolean = false,
     val cloudApiKey: String = "",
-    val cloudEndpointUrl: String = "https://api-inference.huggingface.co/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
+    val cloudEndpointUrl: String = "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
     val isNeuralModelReady: Boolean = false,
     val loadedModelName: String = "Nessuno",
+    val activeAccelerator: String = "CPU",
     val postSavePolishEnabled: Boolean = true,
     val gridEnabled: Boolean = true,
     val locationTagEnabled: Boolean = false,
     val hasLocationPermission: Boolean = false,
     val isRecordingVideo: Boolean = false,
     val lastCapturedUri: String? = null,
-    val bannerMessage: String? = null
+    val bannerMessage: String? = null,
+    val persistentStatus: String? = null
 )
