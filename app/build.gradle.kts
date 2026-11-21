@@ -12,8 +12,8 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 8
-        versionName = "3.2.0-hybrid-sr"
+        versionCode = 9
+        versionName = "4.0.0-pro-sr"
     }
 
     buildTypes {
@@ -53,6 +53,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
 

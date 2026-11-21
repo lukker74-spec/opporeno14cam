@@ -1,8 +1,10 @@
 package com.reno14.freshcam
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
@@ -12,6 +14,8 @@ import android.graphics.YuvImage
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.location.Location
+import android.location.LocationManager
 import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
@@ -38,6 +42,7 @@ import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.exifinterface.media.ExifInterface
 import androidx.lifecycle.LifecycleOwner
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
@@ -66,6 +71,7 @@ class FreshCameraEngine(
     private var discoveredLenses: List<PhysicalLensInfo> = emptyList()
 
     fun checkNeuralModelReady(): Boolean = neuralEngine.isModelAvailable()
+    fun getLoadedModelName(): String = neuralEngine.loadedAssetName
 
     fun discoverLenses(): List<PhysicalLensInfo> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -147,6 +153,7 @@ class FreshCameraEngine(
                 val pExt = Camera2Interop.Extender(previewBuilder)
                 val cExt = Camera2Interop.Extender(captureBuilder)
 
+                // Massimizza qualità ottica e ISP Hardware sul sensore
                 val nrMode = if (state.captureFormat == CaptureFormat.RAW) {
                     CaptureRequest.NOISE_REDUCTION_MODE_FAST
                 } else {
@@ -162,6 +169,8 @@ class FreshCameraEngine(
                 pExt.setCaptureRequestOption(CaptureRequest.EDGE_MODE, edgeMode)
                 cExt.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, nrMode)
                 cExt.setCaptureRequestOption(CaptureRequest.EDGE_MODE, edgeMode)
+                cExt.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
+                cExt.setCaptureRequestOption(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_HIGH_QUALITY)
 
                 val oisMode = if (state.stabilizationEnabled) {
                     CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
@@ -256,7 +265,7 @@ class FreshCameraEngine(
 
                 bound.cameraInfo.zoomState.value?.let { zs ->
                     onZoomBounds(zs.minZoomRatio, zs.maxZoomRatio)
-                    bound.cameraControl.setZoomRatio(state.zoomRatio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio))
+                    bound.cameraControl.setZoomRatio(state.lensZoomRatio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio))
                 }
             } catch (e: Exception) {
                 Log.e("Reno14FreshCam", "Errore avvio fotocamera", e)
@@ -282,6 +291,24 @@ class FreshCameraEngine(
         camera?.cameraControl?.cancelFocusAndMetering()
     }
 
+    @SuppressLint("MissingPermission")
+    private fun getLastKnownLocation(): Location? {
+        val fine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!fine && !coarse) return null
+
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
+        val providers = lm.getProviders(true)
+        var best: Location? = null
+        for (p in providers) {
+            val loc = try { lm.getLastKnownLocation(p) } catch (_: Exception) { null }
+            if (loc != null && (best == null || loc.accuracy < best.accuracy)) {
+                best = loc
+            }
+        }
+        return best
+    }
+
     fun shootInstant(
         snapshot: FreshCamState,
         onResult: (uriString: String?, message: String) -> Unit
@@ -290,6 +317,8 @@ class FreshCameraEngine(
             onResult(null, "Fotocamera non pronta")
             return
         }
+
+        val capturedLocation = if (snapshot.locationTagEnabled) getLastKnownLocation() else null
 
         cap.takePicture(
             ContextCompat.getMainExecutor(context),
@@ -320,8 +349,7 @@ class FreshCameraEngine(
                                         strength = 0.0f,
                                         brightnessBoost = snapshot.brightnessBoost
                                     ),
-                                    neuralApplied = false,
-                                    detailNote = "RAW"
+                                    modeApplied = "RAW"
                                 )
                             } else {
                                 neuralEngine.process(
@@ -331,15 +359,15 @@ class FreshCameraEngine(
                                     brightnessBoost = snapshot.brightnessBoost,
                                     aiMode = snapshot.aiMode,
                                     isTeleLens = snapshot.activeLens == LensType.TELE_50MP,
-                                    zoomRatio = snapshot.zoomRatio,
+                                    lensZoomRatio = snapshot.lensZoomRatio,
                                     superResEnabled = snapshot.neuralSuperResEnabled,
                                     postSavePolish = snapshot.postSavePolishEnabled
                                 )
                             }
 
                             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
-                            val srTag = if (outcome.neuralApplied) "_SR" else ""
-                            val name = "FreshCam_${snapshot.profile.id}_${snapshot.activeLens.name.lowercase()}${srTag}_$stamp.jpg"
+                            val zoomTag = "${String.format(Locale.US, "%.1f", snapshot.displayZoom)}x"
+                            val name = "FreshCam_${snapshot.profile.id}_${zoomTag}_$stamp.jpg"
 
                             val values = ContentValues().apply {
                                 put(MediaStore.MediaColumns.DISPLAY_NAME, name)
@@ -354,8 +382,20 @@ class FreshCameraEngine(
                                 context.contentResolver.openOutputStream(uri)?.use { out ->
                                     outcome.bitmap.compress(Bitmap.CompressFormat.JPEG, 98, out)
                                 }
+                                if (capturedLocation != null) {
+                                    try {
+                                        context.contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                                            val exif = ExifInterface(pfd.fileDescriptor)
+                                            exif.setGpsInfo(capturedLocation)
+                                            exif.saveAttributes()
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.w("Reno14FreshCam", "Impossibile scrivere EXIF GPS", e)
+                                    }
+                                }
+                                val gpsNote = if (capturedLocation != null) " · GPS" else ""
                                 ContextCompat.getMainExecutor(context).execute {
-                                    onResult(uri.toString(), "Salvata (${outcome.detailNote})")
+                                    onResult(uri.toString(), "Salvata (${outcome.modeApplied}$gpsNote)")
                                 }
                             } else {
                                 ContextCompat.getMainExecutor(context).execute {
@@ -407,12 +447,18 @@ class FreshCameraEngine(
             }
         }
 
-        val outOpt = MediaStoreOutputOptions.Builder(
+        val outOptBuilder = MediaStoreOutputOptions.Builder(
             context.contentResolver,
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        ).setContentValues(values).build()
+        ).setContentValues(values)
 
-        activeRecording = vc.output.prepareRecording(context, outOpt)
+        if (state.locationTagEnabled) {
+            getLastKnownLocation()?.let { loc ->
+                outOptBuilder.setLocation(loc)
+            }
+        }
+
+        activeRecording = vc.output.prepareRecording(context, outOptBuilder.build())
             .withAudioEnabled()
             .start(ContextCompat.getMainExecutor(context)) { event ->
                 when (event) {

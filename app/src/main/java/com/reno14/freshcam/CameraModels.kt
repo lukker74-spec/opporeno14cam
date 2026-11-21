@@ -196,7 +196,10 @@ data class FreshCamState(
     val shootingMode: ShootingMode = ShootingMode.PHOTO,
     val flashMode: FlashMode = FlashMode.AUTO,
     val hdrMode: HdrMode = HdrMode.NATURAL,
-    val zoomRatio: Float = 1.0f,
+    // Zoom unificato per display (0.6x = ultrawide, 1.0x = main, 3.5x..35x = tele)
+    val displayZoom: Float = 1.0f,
+    // Zoom interno relativo alla lente attiva (1.0f = focale nativa della lente selezionata)
+    val lensZoomRatio: Float = 1.0f,
     val maxLensZoomRatio: Float = 10.0f,
     val brightnessBoost: Float = 0.08f,
     val evCompensation: Int = 1,
@@ -204,10 +207,13 @@ data class FreshCamState(
     val isoValue: Int = 160,
     val shutterSpeedDenom: Int = 125,
     val stabilizationEnabled: Boolean = true,
-    val neuralSuperResEnabled: Boolean = false,
+    val neuralSuperResEnabled: Boolean = true,
     val isNeuralModelReady: Boolean = false,
+    val loadedModelName: String = "Nessuno",
     val postSavePolishEnabled: Boolean = true,
     val gridEnabled: Boolean = true,
+    val locationTagEnabled: Boolean = false,
+    val hasLocationPermission: Boolean = false,
     val isRecordingVideo: Boolean = false,
     val lastCapturedUri: String? = null,
     val bannerMessage: String? = null
