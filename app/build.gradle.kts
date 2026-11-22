@@ -12,8 +12,8 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 18
-        versionName = "12.0.0-prodial-unified-ai"
+        versionCode = 19
+        versionName = "13.0.0-stable-pro"
     }
 
     buildTypes {
@@ -38,10 +38,6 @@ android {
     buildFeatures {
         compose = true
     }
-
-    androidResources {
-        noCompress += "tflite"
-    }
 }
 
 dependencies {
@@ -54,8 +50,6 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
-
-    implementation("org.tensorflow:tensorflow-lite:2.16.1")
 
     val cameraxVersion = "1.4.1"
     implementation("androidx.camera:camera-core:$cameraxVersion")

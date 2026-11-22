@@ -3,26 +3,19 @@ package com.reno14.freshcam
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Paint
-import android.graphics.Rect
 import android.util.Base64
 import android.util.Log
 import org.json.JSONObject
-import org.tensorflow.lite.DataType
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.io.ByteArrayOutputStream
-import java.io.FileInputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.channels.FileChannel
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 data class NeuralProcessResult(
     val bitmap: Bitmap,
@@ -30,75 +23,24 @@ data class NeuralProcessResult(
 )
 
 /**
- * Motore Fotografico & AI v12.0 (Generale, Pulito, Potente):
- * - Nessuna modalità rigida che rovina altri scatti: il motore si adatta automaticamente
- *   alla lente (IMX882 1x vs Tele JN5 3.5x-7x), al fattore di zoom (fino a 120x) e al movimento.
- * - Anti-Ghosting automatico nel Burst: se rileva movimento nella scena scarta i frame mossi
- *   invece di creare doppie sagome.
- * - Teleobiettivo JN5 (3.5x-7x): deconvoluzione ottica dedicata anche con AI OFF.
- * - Zoom spinto (20x-120x): ritaglio digitale ad alta precisione + Burst anti-ghosting + NNAPI + Cloud AI.
+ * Motore Fotografico Computazionale v13.0 (Zero TFLite distruttivo · Zero Freeze):
+ *
+ * 1) MOTORE LOCALE DI FOTOGRAFIA COMPUTAZIONALE (Sola Luminanza + Colori Intatti):
+ *    - Rimosso il vecchio ritaglio a tasselli 128x128 TFLite che degradava le foto reali.
+ *    - Sostituito con una pipeline multi-scala Edge-Preserving che lavora SOLO sulla luminanza (Y):
+ *      a) Local Tone Mapping (HDR naturale): apre le ombre profonde e salva le alte luci
+ *         in modo morbido, dando profondità reale e gamma dinamica superiore ad AI Off.
+ *      b) Micro-Contrasto Fine + Medio con Noise-Gate (Coring): esalta i dettagli reali
+ *         (texture, occhi, palazzi, foglie) ignorando completamente il micro-rumore sulle zone piatte.
+ *      c) Deconvoluzione ottica dedicata per Tele 3.5x (Samsung JN5).
+ *      d) Chroma Denoise mirato solo dove serve, senza mai impastare i bordi.
+ *
+ * 2) MOTORE CLOUD AI v13 (Swin2SR Classical x2 + Fusione Luminanza Radiale):
+ *    - Usa un modello addestrato su foto pulite (niente deformazioni BSRGAN).
+ *    - Invece di incollare un riquadro rettangolare, estrae SOLO il dettaglio fine di luminanza
+ *      e lo fonde con una maschera radiale morbida (zero bordi visibili, colori originali intatti).
  */
-class NeuralSuperResEngine(private val context: Context) {
-
-    private var interpreter: Interpreter? = null
-    private var nnApiDelegate: NnApiDelegate? = null
-    private var initAttempted: Boolean = false
-    var loadedAssetName: String = "Nessuno"
-        private set
-    var acceleratorName: String = "CPU"
-        private set
-
-    @Synchronized
-    fun isModelAvailable(): Boolean = getInterpreter() != null
-
-    @Synchronized
-    private fun getInterpreter(): Interpreter? {
-        if (initAttempted) return interpreter
-        initAttempted = true
-        val candidates = listOf("superres.tflite", "esrgan.tflite")
-        for (assetName in candidates) {
-            try {
-                val afd = context.assets.openFd(assetName)
-                if (afd.declaredLength < 1024L) continue
-                val inputStream = FileInputStream(afd.fileDescriptor)
-                val fileChannel = inputStream.channel
-                val mappedBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.declaredLength)
-
-                var tflite: Interpreter? = null
-                try {
-                    val delegate = NnApiDelegate()
-                    val nnOpts = Interpreter.Options().apply {
-                        addDelegate(delegate)
-                        setNumThreads(4)
-                    }
-                    tflite = Interpreter(mappedBuffer, nnOpts)
-                    nnApiDelegate = delegate
-                    acceleratorName = "MediaTek APU 780 (NNAPI)"
-                } catch (_: Throwable) {
-                    nnApiDelegate?.close()
-                    nnApiDelegate = null
-                    val cpuOpts = Interpreter.Options().apply {
-                        setNumThreads(4)
-                    }
-                    tflite = Interpreter(mappedBuffer, cpuOpts)
-                    acceleratorName = "CPU Dimensity 4T"
-                }
-
-                val inShape = tflite!!.getInputTensor(0).shape()
-                val outShape = tflite.getOutputTensor(0).shape()
-                if (inShape.size != 4 || outShape.size != 4) {
-                    tflite.close()
-                    continue
-                }
-                interpreter = tflite
-                loadedAssetName = assetName
-                return tflite
-            } catch (e: Throwable) {
-                Log.w("NeuralSR", "Asset $assetName non caricabile: ${e.message}")
-            }
-        }
-        return null
-    }
+class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Context) {
 
     fun processBurst(
         frames: List<Bitmap>,
@@ -113,8 +55,6 @@ class NeuralSuperResEngine(private val context: Context) {
         cloudApiKey: String,
         postSavePolish: Boolean
     ): NeuralProcessResult {
-        // Se lo zoom richiesto supera il massimo zoom hardware della lente (es. 60x-120x),
-        // esegue un ritaglio digitale pulito prima dell'elaborazione AI
         val croppedFrames = if (digitalExtraZoom > 1.03f) {
             frames.map { applyDigitalCrop(it, digitalExtraZoom) }
         } else {
@@ -132,96 +72,118 @@ class NeuralSuperResEngine(private val context: Context) {
 
         if (!aiPreset.isEnabled) {
             if (isTeleLens) {
-                val teleOpt = applyTeleOpticalDeconvolution(working, strength = 0.34f)
+                val teleOpt = applyLuminanceComputationalPass(
+                    source = working,
+                    fineClarity = 0.22f,
+                    mediumClarity = 0.08f,
+                    shadowRecovery = 0.0f,
+                    highlightProtect = 0.12f,
+                    noiseGate = 4.0f
+                )
                 if (teleOpt !== working) working.recycle()
                 working = teleOpt
             }
             if (postSavePolish) {
-                val toned = applyTrueColorToneCurve(working, strength = 0.30f)
+                val toned = applySubtleFilmicCurve(working, strength = 0.25f)
                 if (toned !== working) working.recycle()
                 working = toned
             }
             if (croppedFrames !== frames) croppedFrames.forEach { if (!it.isRecycled) it.recycle() }
             return NeuralProcessResult(
                 bitmap = working,
-                modeApplied = if (isTeleLens) "Tele Ottico (AI Off)" else "Naturale (AI Off)"
+                modeApplied = if (isTeleLens) "Tele Ottico (AI Off)" else "Ottica Pura (AI Off)"
             )
         }
 
-        val isOpticalRange = displayZoom <= 7.05f
-        val isTeleSpinto = displayZoom >= 8.0f
-        val isTeleEstremo = displayZoom >= 20.0f
+        val isTeleSpinto = displayZoom >= 10.0f
         val level = aiPreset.level
 
-        // 1. Burst Multi-Frame con protezione automatica Anti-Ghosting (solo sopra i 7x ottici)
+        // 1. Burst Multi-Frame Anti-Ghosting (solo su zoom >= 10x e con verifica rigorosa del movimento)
         var burstUsed = false
         if (isTeleSpinto && croppedFrames.size > 1) {
             try {
                 val gradedExtras = croppedFrames.drop(1).map {
                     profile.applyToBitmap(it, strength = profileIntensity, brightnessBoost = brightnessBoost)
                 }
-                val merged = alignAndMergeBurstAntiGhost(working, gradedExtras)
+                val merged = alignAndMergeBurstSafe(working, gradedExtras)
                 gradedExtras.forEach { if (!it.isRecycled) it.recycle() }
                 if (merged !== working) {
                     working.recycle()
                     working = merged
+                    burstUsed = true
                 }
-                burstUsed = true
             } catch (t: Throwable) {
-                Log.e("NeuralSR", "Burst fallback", t)
+                Log.e("PhotoEngine", "Burst fallback", t)
             }
         }
         if (croppedFrames !== frames) croppedFrames.forEach { if (!it.isRecycled) it.recycle() }
 
-        // 2. Pulizia rumore calibrata (solo chroma sotto 7x, chroma + luma leggera sopra 20x)
-        val denoised = try {
-            filterChromaAndNoise(
-                bitmap = working,
-                chromaPasses = if (isTeleSpinto || isTeleLens) 2 else 1,
-                lumaPasses = if (isTeleEstremo) 1 else 0
+        // 2. Pulizia rumore SOLO cromatico (veloce, su 1 passaggio; mantiene al 100% la nitidezza)
+        if (isTeleLens || isTeleSpinto || level >= 2) {
+            val cleanChroma = try {
+                fastChromaDenoise(working)
+            } catch (_: Throwable) {
+                working
+            }
+            if (cleanChroma !== working && !working.isRecycled) working.recycle()
+            working = cleanChroma
+        }
+
+        // 3. Motore Computazionale Locale Edge-Preserving (Sola Luminanza -> Colori 100% fedeli)
+        val teleBoost = if (isTeleLens) 0.10f else 0.0f
+        val zoomBoost = if (isTeleSpinto) 0.12f else 0.0f
+
+        val fineClarity = when (level) {
+            1 -> 0.24f + teleBoost + zoomBoost
+            2 -> 0.36f + teleBoost + zoomBoost
+            else -> 0.48f + teleBoost + zoomBoost
+        }
+        val mediumClarity = when (level) {
+            1 -> 0.12f
+            2 -> 0.20f
+            else -> 0.28f
+        }
+        val shadowRecovery = when (level) {
+            1 -> 0.12f
+            2 -> 0.22f
+            else -> 0.32f
+        }
+        val highlightProtect = when (level) {
+            1 -> 0.18f
+            2 -> 0.28f
+            else -> 0.36f
+        }
+        val noiseGate = if (isTeleSpinto) 5.5f else 3.5f
+
+        val enhanced = try {
+            applyLuminanceComputationalPass(
+                source = working,
+                fineClarity = fineClarity,
+                mediumClarity = mediumClarity,
+                shadowRecovery = shadowRecovery,
+                highlightProtect = highlightProtect,
+                noiseGate = noiseGate
             )
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            Log.e("PhotoEngine", "Computational pass error", t)
             working
         }
-        if (denoised !== working && !working.isRecycled) working.recycle()
-        working = denoised
+        if (enhanced !== working && !working.isRecycled) working.recycle()
+        working = enhanced
 
-        // 3. Motore Neurale TFLite (MediaTek APU 780 NNAPI)
-        val tflite = getInterpreter()
-        var neuralUsed = false
-        if (tflite != null) {
-            try {
-                val neuralOut = runNeuralDetailEngine(
-                    tflite = tflite,
-                    source = working,
-                    level = level,
-                    isOpticalRange = isOpticalRange,
-                    isTeleEstremo = isTeleEstremo
-                )
-                if (neuralOut !== working) {
-                    working.recycle()
-                    working = neuralOut
-                }
-                neuralUsed = true
-            } catch (t: Throwable) {
-                Log.e("NeuralSR", "Errore TFLite: ${t.message}", t)
-            }
-        }
-
-        // 4. Cloud AI (quando selezionato Cloud Bassa / Media / Alta dal tasto unico AI)
+        // 4. Cloud AI migliorata (Swin2SR Classical x2 + Fusione Luminanza Radiale senza cuciture)
         var cloudStatus = ""
         if (aiPreset.isCloud) {
-            val cloudAlpha = when (level) {
-                1 -> 150
-                2 -> 200
-                else -> 240
+            val cloudStrength = when (level) {
+                1 -> 0.35f
+                2 -> 0.55f
+                else -> 0.75f
             }
-            val (cloudBmp, statusMsg) = tryCloudSuperResolution(
+            val (cloudBmp, statusMsg) = tryCloudDetailFusion(
                 source = working,
                 endpointUrl = cloudEndpointUrl,
                 apiKey = cloudApiKey,
-                isTeleEstremo = isTeleEstremo,
-                blendAlpha = cloudAlpha
+                strength = cloudStrength
             )
             cloudStatus = statusMsg
             if (cloudBmp != null) {
@@ -230,37 +192,10 @@ class NeuralSuperResEngine(private val context: Context) {
             }
         }
 
-        // 5. Deconvoluzione ottica dedicata per Tele JN5 o Micro-dettaglio per Principale IMX882
-        val teleBonus = if (isTeleLens) 0.14f else 0.0f
-        val clarityGain = when {
-            isTeleEstremo -> when (level) {
-                1 -> 0.24f
-                2 -> 0.34f
-                else -> 0.44f
-            }
-            isTeleSpinto -> when (level) {
-                1 -> 0.20f
-                2 -> 0.28f
-                else -> 0.36f
-            }
-            else -> when (level) {
-                1 -> 0.14f + teleBonus
-                2 -> 0.22f + teleBonus
-                else -> 0.30f + teleBonus
-            }
-        }
-        val detailed = try {
-            if (isTeleLens) applyTeleOpticalDeconvolution(working, strength = clarityGain)
-            else applyMultiScaleDetail(working, gain = clarityGain)
-        } catch (_: Throwable) {
-            working
-        }
-        if (detailed !== working && !working.isRecycled) working.recycle()
-        working = detailed
-
+        // 5. Finitura tonale cinematografica leggera
         if (postSavePolish) {
             val toned = try {
-                applyTrueColorToneCurve(working, strength = if (isTeleSpinto) 0.45f else 0.30f)
+                applySubtleFilmicCurve(working, strength = if (level >= 2) 0.38f else 0.26f)
             } catch (_: Throwable) {
                 working
             }
@@ -270,9 +205,8 @@ class NeuralSuperResEngine(private val context: Context) {
 
         val parts = mutableListOf<String>()
         if (burstUsed) parts.add("Burst")
-        if (neuralUsed) parts.add(aiPreset.shortBadge)
+        parts.add(aiPreset.shortBadge)
         if (cloudStatus.isNotEmpty()) parts.add(cloudStatus)
-        if (parts.isEmpty()) parts.add(aiPreset.shortBadge)
 
         return NeuralProcessResult(
             bitmap = working,
@@ -280,386 +214,145 @@ class NeuralSuperResEngine(private val context: Context) {
         )
     }
 
-    private fun applyDigitalCrop(bmp: Bitmap, factor: Float): Bitmap {
-        val f = factor.coerceIn(1.0f, 4.0f)
-        val newW = (bmp.width / f).toInt().coerceAtLeast(256)
-        val newH = (bmp.height / f).toInt().coerceAtLeast(256)
-        val sx = (bmp.width - newW) / 2
-        val sy = (bmp.height - newH) / 2
-        val crop = Bitmap.createBitmap(bmp, sx, sy, newW, newH)
-        val upscaled = Bitmap.createScaledBitmap(crop, bmp.width, bmp.height, true)
-        crop.recycle()
-        return upscaled
-    }
-
-    private fun applyTeleOpticalDeconvolution(bitmap: Bitmap, strength: Float): Bitmap {
-        val w = bitmap.width
-        val h = bitmap.height
-        val src = IntArray(w * h)
-        val dst = IntArray(w * h)
-        bitmap.getPixels(src, 0, w, 0, 0, w, h)
-
-        val fineGain = (strength * 1.15f).coerceIn(0.15f, 0.70f)
-        for (y in 1 until h - 1) {
-            val row = y * w
-            for (x in 1 until w - 1) {
-                val idx = row + x
-                val c = src[idx]
-                val cr = (c ushr 16) and 0xFF
-                val cg = (c ushr 8) and 0xFF
-                val cb = c and 0xFF
-
-                val n = src[idx - w]
-                val s = src[idx + w]
-                val e = src[idx + 1]
-                val west = src[idx - 1]
-
-                val avgR = (((n ushr 16) and 0xFF) + ((s ushr 16) and 0xFF) + ((e ushr 16) and 0xFF) + ((west ushr 16) and 0xFF)) shr 2
-                val avgG = (((n ushr 8) and 0xFF) + ((s ushr 8) and 0xFF) + ((e ushr 8) and 0xFF) + ((west ushr 8) and 0xFF)) shr 2
-                val avgB = ((n and 0xFF) + (s and 0xFF) + (e and 0xFF) + (west and 0xFF)) shr 2
-
-                val dR = (cr - avgR).coerceIn(-22, 22)
-                val dG = (cg - avgG).coerceIn(-22, 22)
-                val dB = (cb - avgB).coerceIn(-22, 22)
-
-                val nr = if (abs(dR) > 3) (cr + dR * fineGain).toInt().coerceIn(0, 255) else cr
-                val ng = if (abs(dG) > 3) (cg + dG * fineGain).toInt().coerceIn(0, 255) else cg
-                val nb = if (abs(dB) > 3) (cb + dB * fineGain).toInt().coerceIn(0, 255) else cb
-
-                dst[idx] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
-            }
-        }
-        copyBorders(src, dst, w, h)
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(dst, 0, w, 0, 0, w, h)
-        return out
-    }
-
-    private fun alignAndMergeBurstAntiGhost(base: Bitmap, extras: List<Bitmap>): Bitmap {
-        val w = base.width
-        val h = base.height
-        val total = w * h
-        val basePx = IntArray(total)
-        base.getPixels(basePx, 0, w, 0, 0, w, h)
-
-        val accR = IntArray(total) { (basePx[it] ushr 16) and 0xFF }
-        val accG = IntArray(total) { (basePx[it] ushr 8) and 0xFF }
-        val accB = IntArray(total) { basePx[it] and 0xFF }
-        val accW = ByteArray(total) { 2 }
-
-        val patchSize = min(140, min(w, h) / 3)
-        val cx = w / 2 - patchSize / 2
-        val cy = h / 2 - patchSize / 2
-        val extPx = IntArray(total)
-
-        for (extra in extras) {
-            if (extra.width != w || extra.height != h) continue
-            extra.getPixels(extPx, 0, w, 0, 0, w, h)
-
-            var bestDx = 0
-            var bestDy = 0
-            var bestSad = Long.MAX_VALUE
-
-            for (dy in -8..8 step 2) {
-                for (dx in -8..8 step 2) {
-                    var sad = 0L
-                    for (py in 0 until patchSize step 4) {
-                        val rowBase = (cy + py) * w
-                        val rowExt = (cy + py + dy) * w
-                        for (px in 0 until patchSize step 4) {
-                            val bVal = basePx[rowBase + cx + px]
-                            val eVal = extPx[rowExt + cx + px + dx]
-                            sad += abs(((bVal ushr 8) and 0xFF) - ((eVal ushr 8) and 0xFF))
-                        }
-                    }
-                    if (sad < bestSad) {
-                        bestSad = sad
-                        bestDx = dx
-                        bestDy = dy
-                    }
-                }
-            }
-
-            // Soglia severa anti-ghosting (16): se un pixel si è spostato tra i frame viene ignorato
-            for (y in 8 until h - 8) {
-                val rowB = y * w
-                val rowE = (y + bestDy) * w
-                for (x in 8 until w - 8) {
-                    val idxB = rowB + x
-                    val idxE = rowE + (x + bestDx)
-                    val bp = basePx[idxB]
-                    val ep = extPx[idxE]
-
-                    val br = (bp ushr 16) and 0xFF
-                    val bg = (bp ushr 8) and 0xFF
-                    val bb = bp and 0xFF
-
-                    val er = (ep ushr 16) and 0xFF
-                    val eg = (ep ushr 8) and 0xFF
-                    val eb = ep and 0xFF
-
-                    if ((abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3 < 16) {
-                        accR[idxB] += er
-                        accG[idxB] += eg
-                        accB[idxB] += eb
-                        accW[idxB] = (accW[idxB] + 1).toByte()
-                    }
-                }
-            }
-        }
-
-        for (i in basePx.indices) {
-            val weight = accW[i].toInt() and 0xFF
-            val r = (accR[i] / weight).coerceIn(0, 255)
-            val g = (accG[i] / weight).coerceIn(0, 255)
-            val b = (accB[i] / weight).coerceIn(0, 255)
-            basePx[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-        }
-
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(basePx, 0, w, 0, 0, w, h)
-        return out
-    }
-
-    private fun runNeuralDetailEngine(
-        tflite: Interpreter,
+    /**
+     * Pipeline computazionale fotografica ad alta velocità (Sola Luminanza):
+     * - Piramide a 3 scale:
+     *   1) fineBlur (scala 1/2): estrae micro-dettaglio nitido (capelli, foglie, scritte)
+     *   2) medBlur (scala 1/8): estrae tridimensionalità / micro-contrasto locale (Clarity)
+     *   3) toneBlur (scala 1/24): mappa di esposizione locale per recuperare ombre e salvare luci (Local HDR)
+     * - Noise-Gate (coring): ignora variazioni sotto `noiseGate` così pelle e cielo restano pulitissimi.
+     * - Preserva al 100% i rapporti cromatici originali.
+     */
+    private fun applyLuminanceComputationalPass(
         source: Bitmap,
-        level: Int,
-        isOpticalRange: Boolean,
-        isTeleEstremo: Boolean
+        fineClarity: Float,
+        mediumClarity: Float,
+        shadowRecovery: Float,
+        highlightProtect: Float,
+        noiseGate: Float
     ): Bitmap {
-        val inTensor = tflite.getInputTensor(0)
-        val outTensor = tflite.getOutputTensor(0)
-        val inShape = inTensor.shape()
-        val outShape = outTensor.shape()
-        val inType = inTensor.dataType()
-        val outType = outTensor.dataType()
-
-        val isNchw = inShape.size == 4 && inShape[1] == 3 && inShape[3] != 3
-        val rawInH = if (isNchw) inShape[2] else inShape[1]
-        val rawInW = if (isNchw) inShape[3] else inShape[2]
-        val inH = (if (rawInH > 0) rawInH else 128).coerceIn(32, 256)
-        val inW = (if (rawInW > 0) rawInW else 128).coerceIn(32, 256)
-
-        val outIsNchw = outShape.size == 4 && outShape[1] == 3 && outShape[3] != 3
-        val rawOutH = if (outIsNchw) outShape[2] else outShape[1]
-        val rawOutW = if (outIsNchw) outShape[3] else outShape[2]
-        val outH = (if (rawOutH > 0) rawOutH else inH * 4).coerceAtLeast(inH)
-        val outW = (if (rawOutW > 0) rawOutW else inW * 4).coerceAtLeast(inW)
-
-        val coverage = if (!isOpticalRange) 0.72f else 0.94f
-        val cols = if (isTeleEstremo) 6 else if (!isOpticalRange) 5 else 4
-        val rows = if (isTeleEstremo) 6 else if (!isOpticalRange) 5 else 4
-
-        val workBase = scaleToMaxSide(source, 1600)
-        val regW = (workBase.width * coverage).toInt().coerceAtLeast(cols * 32)
-        val regH = (workBase.height * coverage).toInt().coerceAtLeast(rows * 32)
-        val startX = (workBase.width - regW) / 2
-        val startY = (workBase.height - regH) / 2
-
-        val neuralMap = workBase.copy(Bitmap.Config.ARGB_8888, true)
-        val baselineMap = workBase.copy(Bitmap.Config.ARGB_8888, true)
-        val neuralCanvas = Canvas(neuralMap)
-        val baseCanvas = Canvas(baselineMap)
-
-        val cellW = regW / cols
-        val cellH = regH / rows
-
-        val bytesPerChannelIn = if (inType == DataType.UINT8) 1 else 4
-        val bytesPerChannelOut = if (outType == DataType.UINT8) 1 else 4
-
-        val inByteCount = inTensor.numBytes().coerceAtLeast(1 * inH * inW * 3 * bytesPerChannelIn)
-        val outByteCount = outTensor.numBytes().coerceAtLeast(1 * outH * outW * 3 * bytesPerChannelOut)
-
-        val inputBuffer = ByteBuffer.allocateDirect(inByteCount).order(ByteOrder.nativeOrder())
-        val outputBuffer = ByteBuffer.allocateDirect(outByteCount).order(ByteOrder.nativeOrder())
-        val tilePixels = IntArray(inW * inH)
-        val outPixels = IntArray(outW * outH)
-        val srPatch = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-
-        for (r in 0 until rows) {
-            for (c in 0 until cols) {
-                val left = startX + c * cellW
-                val top = startY + r * cellH
-                val right = if (c == cols - 1) startX + regW else left + cellW
-                val bottom = if (r == rows - 1) startY + regH else top + cellH
-
-                val cw = (right - left).coerceAtLeast(1)
-                val ch = (bottom - top).coerceAtLeast(1)
-
-                val crop = Bitmap.createBitmap(workBase, left, top, cw, ch)
-                val scaledIn = Bitmap.createScaledBitmap(crop, inW, inH, true)
-                crop.recycle()
-                scaledIn.getPixels(tilePixels, 0, inW, 0, 0, inW, inH)
-
-                inputBuffer.rewind()
-                if (inType == DataType.UINT8) {
-                    if (isNchw) {
-                        for (p in tilePixels) inputBuffer.put(((p ushr 16) and 0xFF).toByte())
-                        for (p in tilePixels) inputBuffer.put(((p ushr 8) and 0xFF).toByte())
-                        for (p in tilePixels) inputBuffer.put((p and 0xFF).toByte())
-                    } else {
-                        for (p in tilePixels) {
-                            inputBuffer.put(((p ushr 16) and 0xFF).toByte())
-                            inputBuffer.put(((p ushr 8) and 0xFF).toByte())
-                            inputBuffer.put((p and 0xFF).toByte())
-                        }
-                    }
-                } else {
-                    val scaleIn = if (inH >= 64) 1f / 255f else 1f
-                    if (isNchw) {
-                        for (p in tilePixels) inputBuffer.putFloat(((p ushr 16) and 0xFF) * scaleIn)
-                        for (p in tilePixels) inputBuffer.putFloat(((p ushr 8) and 0xFF) * scaleIn)
-                        for (p in tilePixels) inputBuffer.putFloat((p and 0xFF) * scaleIn)
-                    } else {
-                        for (p in tilePixels) {
-                            inputBuffer.putFloat(((p ushr 16) and 0xFF) * scaleIn)
-                            inputBuffer.putFloat(((p ushr 8) and 0xFF) * scaleIn)
-                            inputBuffer.putFloat((p and 0xFF) * scaleIn)
-                        }
-                    }
-                }
-                inputBuffer.rewind()
-                outputBuffer.rewind()
-
-                tflite.run(inputBuffer, outputBuffer)
-                outputBuffer.rewind()
-
-                if (outType == DataType.UINT8) {
-                    if (outIsNchw) {
-                        val plane = outW * outH
-                        for (i in 0 until plane) {
-                            val red = outputBuffer.get(i).toInt() and 0xFF
-                            val green = outputBuffer.get(plane + i).toInt() and 0xFF
-                            val blue = outputBuffer.get(2 * plane + i).toInt() and 0xFF
-                            outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
-                        }
-                    } else {
-                        for (i in outPixels.indices) {
-                            val red = outputBuffer.get().toInt() and 0xFF
-                            val green = outputBuffer.get().toInt() and 0xFF
-                            val blue = outputBuffer.get().toInt() and 0xFF
-                            outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
-                        }
-                    }
-                } else {
-                    val scaleOut = if (inH >= 64) 255f else 1f
-                    if (outIsNchw) {
-                        val plane = outW * outH
-                        for (i in 0 until plane) {
-                            val red = (outputBuffer.getFloat(i * 4) * scaleOut).toInt().coerceIn(0, 255)
-                            val green = (outputBuffer.getFloat((plane + i) * 4) * scaleOut).toInt().coerceIn(0, 255)
-                            val blue = (outputBuffer.getFloat((2 * plane + i) * 4) * scaleOut).toInt().coerceIn(0, 255)
-                            outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
-                        }
-                    } else {
-                        for (i in outPixels.indices) {
-                            val red = (outputBuffer.float * scaleOut).toInt().coerceIn(0, 255)
-                            val green = (outputBuffer.float * scaleOut).toInt().coerceIn(0, 255)
-                            val blue = (outputBuffer.float * scaleOut).toInt().coerceIn(0, 255)
-                            outPixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
-                        }
-                    }
-                }
-
-                srPatch.setPixels(outPixels, 0, outW, 0, 0, outW, outH)
-                val dstRect = Rect(left, top, right, bottom)
-                neuralCanvas.drawBitmap(srPatch, null, dstRect, paint)
-                baseCanvas.drawBitmap(scaledIn, null, dstRect, paint)
-                scaledIn.recycle()
-            }
-        }
-        srPatch.recycle()
-        if (workBase !== source) workBase.recycle()
-
-        val fullNeural = Bitmap.createScaledBitmap(neuralMap, source.width, source.height, true)
-        val fullBaseline = Bitmap.createScaledBitmap(baselineMap, source.width, source.height, true)
-        neuralMap.recycle()
-        baselineMap.recycle()
-
-        val residualStrength = when {
-            isTeleEstremo -> when (level) {
-                1 -> 0.85f
-                2 -> 1.15f
-                else -> 1.40f
-            }
-            !isOpticalRange -> when (level) {
-                1 -> 0.60f
-                2 -> 0.85f
-                else -> 1.10f
-            }
-            else -> when (level) {
-                1 -> 0.30f
-                2 -> 0.45f
-                else -> 0.60f
-            }
-        }
-
-        val detailCap = if (isOpticalRange) 18f else 26f
         val w = source.width
         val h = source.height
-        val origPx = IntArray(w * h)
-        val neurPx = IntArray(w * h)
-        val basePx = IntArray(w * h)
+        val total = w * h
 
-        source.getPixels(origPx, 0, w, 0, 0, w, h)
-        fullNeural.getPixels(neurPx, 0, w, 0, 0, w, h)
-        fullBaseline.getPixels(basePx, 0, w, 0, 0, w, h)
-        fullNeural.recycle()
-        fullBaseline.recycle()
+        val fineSmall = Bitmap.createScaledBitmap(source, max(2, w / 2), max(2, h / 2), true)
+        val fineBlurBmp = Bitmap.createScaledBitmap(fineSmall, w, h, true)
+        fineSmall.recycle()
 
-        for (i in origPx.indices) {
-            val o = origPx[i]
-            val n = neurPx[i]
-            val b = basePx[i]
+        val medSmall = Bitmap.createScaledBitmap(source, max(2, w / 8), max(2, h / 8), true)
+        val medBlurBmp = Bitmap.createScaledBitmap(medSmall, w, h, true)
+        medSmall.recycle()
 
-            val or = (o ushr 16) and 0xFF
-            val og = (o ushr 8) and 0xFF
-            val ob = o and 0xFF
+        val toneSmall = Bitmap.createScaledBitmap(source, max(2, w / 24), max(2, h / 24), true)
+        val toneBlurBmp = Bitmap.createScaledBitmap(toneSmall, w, h, true)
+        toneSmall.recycle()
 
-            val yOrig = 0.299f * or + 0.587f * og + 0.114f * ob
-            val yNeur = 0.299f * ((n ushr 16) and 0xFF) + 0.587f * ((n ushr 8) and 0xFF) + 0.114f * (n and 0xFF)
-            val yBase = 0.299f * ((b ushr 16) and 0xFF) + 0.587f * ((b ushr 8) and 0xFF) + 0.114f * (b and 0xFF)
+        val px = IntArray(total)
+        val finePx = IntArray(total)
+        val medPx = IntArray(total)
+        val tonePx = IntArray(total)
 
-            val rawDetail = (yNeur - yBase).coerceIn(-detailCap, detailCap)
-            val cleanDetail = if (abs(rawDetail) < 2.2f) 0f else rawDetail
-            val yEnhanced = (yOrig + cleanDetail * residualStrength).coerceIn(0f, 255f)
-            val delta = yEnhanced - yOrig
+        source.getPixels(px, 0, w, 0, 0, w, h)
+        fineBlurBmp.getPixels(finePx, 0, w, 0, 0, w, h)
+        fineBlurBmp.recycle()
+        medBlurBmp.getPixels(medPx, 0, w, 0, 0, w, h)
+        medBlurBmp.recycle()
+        toneBlurBmp.getPixels(tonePx, 0, w, 0, 0, w, h)
+        toneBlurBmp.recycle()
 
-            val outR = (or + delta).toInt().coerceIn(0, 255)
-            val outG = (og + delta).toInt().coerceIn(0, 255)
-            val outB = (ob + delta).toInt().coerceIn(0, 255)
+        for (i in 0 until total) {
+            val c = px[i]
+            val r = (c ushr 16) and 0xFF
+            val g = (c ushr 8) and 0xFF
+            val b = c and 0xFF
 
-            origPx[i] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
+            val yOrig = 0.299f * r + 0.587f * g + 0.114f * b
+
+            val fc = finePx[i]
+            val yFine = 0.299f * ((fc ushr 16) and 0xFF) + 0.587f * ((fc ushr 8) and 0xFF) + 0.114f * (fc and 0xFF)
+
+            val mc = medPx[i]
+            val yMed = 0.299f * ((mc ushr 16) and 0xFF) + 0.587f * ((mc ushr 8) and 0xFF) + 0.114f * (mc and 0xFF)
+
+            val tc = tonePx[i]
+            val yTone = 0.299f * ((tc ushr 16) and 0xFF) + 0.587f * ((tc ushr 8) and 0xFF) + 0.114f * (tc and 0xFF)
+
+            // 1. Micro-dettaglio fine con Noise-Gate morbido (zero rumore su cielo/pelle)
+            val rawFine = yOrig - yFine
+            val absFine = abs(rawFine)
+            val gatedFine = if (absFine <= noiseGate) {
+                0f
+            } else {
+                val sign = if (rawFine >= 0f) 1f else -1f
+                sign * (absFine - noiseGate).coerceAtMost(24f)
+            }
+
+            // 2. Micro-contrasto locale medio (tridimensionalità fotografica)
+            val medDetail = (yFine - yMed).coerceIn(-22f, 22f)
+
+            // Protezione anti-alone su alte luci (>220) e ombre profondissime (<16)
+            val haloGuard = when {
+                yOrig > 220f -> ((255f - yOrig) / 35f).coerceIn(0.15f, 1.0f)
+                yOrig < 16f -> (yOrig / 16f).coerceIn(0.20f, 1.0f)
+                else -> 1.0f
+            }
+
+            var deltaY = (gatedFine * fineClarity + medDetail * mediumClarity) * haloGuard
+
+            // 3. Local Tone Mapping (recupero ombre + protezione alte luci naturale)
+            if (shadowRecovery > 0.01f && yTone < 95f && yOrig > 4f) {
+                val shadowWeight = ((95f - yTone) / 95f).pow(1.6f)
+                deltaY += shadowWeight * shadowRecovery * 28f
+            }
+            if (highlightProtect > 0.01f && yTone > 185f) {
+                val hiWeight = ((yTone - 185f) / 70f).coerceIn(0f, 1f)
+                deltaY -= hiWeight * highlightProtect * 22f
+            }
+
+            val yNew = (yOrig + deltaY).coerceIn(0f, 255f)
+            val diff = yNew - yOrig
+
+            // Applica la variazione di luminanza preservando la saturazione senza dominanti
+            val nr = (r + diff).toInt().coerceIn(0, 255)
+            val ng = (g + diff).toInt().coerceIn(0, 255)
+            val nb = (b + diff).toInt().coerceIn(0, 255)
+
+            px[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
         }
 
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(origPx, 0, w, 0, 0, w, h)
+        out.setPixels(px, 0, w, 0, 0, w, h)
         return out
     }
 
-    private fun tryCloudSuperResolution(
+    /**
+     * Cloud AI v13 con Fusione Luminanza Radiale (Zero riquadri, zero alterazione colori):
+     * - Usa Swin2SR Classical x2 (addestrato su foto pulite).
+     * - Invia un ritaglio ad alta qualità del soggetto centrale (fino a 768px).
+     * - Estrae SOLO il dettaglio luminanza aggiunto dal modello Cloud rispetto al bicubico,
+     *   lo limita contro artefatti e lo sfuma con una finestra radiale coseno morbida.
+     */
+    private fun tryCloudDetailFusion(
         source: Bitmap,
         endpointUrl: String,
         apiKey: String,
-        isTeleEstremo: Boolean,
-        blendAlpha: Int
+        strength: Float
     ): Pair<Bitmap?, String> {
+        if (endpointUrl.isBlank()) return null to "Cloud: URL mancante"
         return try {
-            val cropRatio = if (isTeleEstremo) 0.55f else 0.72f
+            val cropRatio = 0.72f
             val cw = (source.width * cropRatio).toInt().coerceIn(256, source.width)
             val ch = (source.height * cropRatio).toInt().coerceIn(256, source.height)
             val sx = (source.width - cw) / 2
             val sy = (source.height - ch) / 2
 
             val centerCrop = Bitmap.createBitmap(source, sx, sy, cw, ch)
-            val uploadBmp = scaleToMaxSide(centerCrop, 768)
-            if (uploadBmp !== centerCrop) centerCrop.recycle()
+            val uploadBmp = scaleToMaxSide(centerCrop, 640)
+            val baseU = uploadBmp.width
+            val baseH = uploadBmp.height
 
             val baos = ByteArrayOutputStream()
             uploadBmp.compress(Bitmap.CompressFormat.JPEG, 94, baos)
-            uploadBmp.recycle()
             val payload = baos.toByteArray()
 
             val conn = (URL(endpointUrl).openConnection() as HttpURLConnection).apply {
@@ -695,29 +388,259 @@ class NeuralSuperResEngine(private val context: Context) {
                 }
 
                 if (cloudPatch != null) {
-                    val result = source.copy(Bitmap.Config.ARGB_8888, true)
-                    val canvas = Canvas(result)
-                    val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-                        alpha = blendAlpha.coerceIn(100, 255)
-                    }
-                    canvas.drawBitmap(cloudPatch, null, Rect(sx, sy, sx + cw, sy + ch), paint)
+                    // Scala sia il risultato Cloud sia la baseline inviata alla dimensione del crop originale
+                    val cloudScaled = Bitmap.createScaledBitmap(cloudPatch, cw, ch, true)
+                    val baseScaled = Bitmap.createScaledBitmap(uploadBmp, cw, ch, true)
                     cloudPatch.recycle()
-                    return result to "Cloud OK"
+                    if (uploadBmp !== centerCrop) uploadBmp.recycle()
+                    centerCrop.recycle()
+
+                    val out = source.copy(Bitmap.Config.ARGB_8888, true)
+                    val origPx = IntArray(cw * ch)
+                    val cloudPx = IntArray(cw * ch)
+                    val basePx = IntArray(cw * ch)
+
+                    out.getPixels(origPx, 0, cw, sx, sy, cw, ch)
+                    cloudScaled.getPixels(cloudPx, 0, cw, 0, 0, cw, ch)
+                    baseScaled.getPixels(basePx, 0, cw, 0, 0, cw, ch)
+                    cloudScaled.recycle()
+                    baseScaled.recycle()
+
+                    val halfW = cw / 2f
+                    val halfH = ch / 2f
+
+                    for (y in 0 until ch) {
+                        val ny = (y - halfH) / halfH
+                        val row = y * cw
+                        for (x in 0 until cw) {
+                            val nx = (x - halfW) / halfW
+                            val dist = sqrt(nx * nx + ny * ny)
+                            if (dist >= 1.0f) continue
+
+                            // Maschera radiale coseno: 1.0 al centro, sfuma dolcemente a 0.0 sui bordi
+                            val radialMask = if (dist < 0.65f) {
+                                1.0f
+                            } else {
+                                val t = ((dist - 0.65f) / 0.35f).coerceIn(0f, 1f)
+                                (0.5f * (1f + cos(t * Math.PI))).toFloat()
+                            }
+
+                            val idx = row + x
+                            val o = origPx[idx]
+                            val c = cloudPx[idx]
+                            val b = basePx[idx]
+
+                            val or = (o ushr 16) and 0xFF
+                            val og = (o ushr 8) and 0xFF
+                            val ob = o and 0xFF
+
+                            val yCloud = 0.299f * ((c ushr 16) and 0xFF) + 0.587f * ((c ushr 8) and 0xFF) + 0.114f * (c and 0xFF)
+                            val yBase = 0.299f * ((b ushr 16) and 0xFF) + 0.587f * ((b ushr 8) and 0xFF) + 0.114f * (b and 0xFF)
+
+                            // Estrae SOLO il dettaglio luminanza pulito con clamp anti-artefatti
+                            val detail = (yCloud - yBase).coerceIn(-22f, 22f)
+                            val delta = detail * strength * radialMask
+
+                            val nr = (or + delta).toInt().coerceIn(0, 255)
+                            val ng = (og + delta).toInt().coerceIn(0, 255)
+                            val nb = (ob + delta).toInt().coerceIn(0, 255)
+
+                            origPx[idx] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+                        }
+                    }
+
+                    out.setPixels(origPx, 0, cw, sx, sy, cw, ch)
+                    return out to "Cloud OK (${baseU}x${baseH})"
                 }
+                if (uploadBmp !== centerCrop) uploadBmp.recycle()
+                centerCrop.recycle()
                 return null to "Cloud: risposta vuota"
             } else {
+                if (uploadBmp !== centerCrop) uploadBmp.recycle()
+                centerCrop.recycle()
                 val errHint = when (code) {
                     401, 403 -> "Token HF richiesto"
-                    404 -> "Endpoint non trovato"
+                    404 -> "Modello non trovato"
                     503 -> "Modello in avvio"
                     else -> "HTTP $code"
                 }
                 return null to "Cloud: $errHint"
             }
         } catch (e: Throwable) {
-            Log.w("NeuralSR", "Errore Cloud AI: ${e.message}")
+            Log.w("PhotoEngine", "Errore Cloud AI: ${e.message}")
             null to "Cloud: timeout/rete"
         }
+    }
+
+    /**
+     * Chroma denoise veloce (1 passaggio): rimuove le macchie colorate di rumore
+     * lasciando intatta al 100% la luminanza (nitidezza).
+     */
+    private fun fastChromaDenoise(bitmap: Bitmap): Bitmap {
+        val w = bitmap.width
+        val h = bitmap.height
+        val src = IntArray(w * h)
+        val dst = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
+
+        for (y in 1 until h - 1) {
+            val row = y * w
+            for (x in 1 until w - 1) {
+                val idx = row + x
+                val c = src[idx]
+                val r = (c ushr 16) and 0xFF
+                val g = (c ushr 8) and 0xFF
+                val b = c and 0xFF
+                val yC = (77 * r + 150 * g + 29 * b) shr 8
+
+                var sumU = (b - yC) * 2
+                var sumV = (r - yC) * 2
+                var cnt = 2
+
+                val n1 = src[idx - w]
+                val n2 = src[idx + w]
+                val n3 = src[idx - 1]
+                val n4 = src[idx + 1]
+
+                val neighbors = intArrayOf(n1, n2, n3, n4)
+                for (n in neighbors) {
+                    val nr = (n ushr 16) and 0xFF
+                    val ng = (n ushr 8) and 0xFF
+                    val nb = n and 0xFF
+                    val yN = (77 * nr + 150 * ng + 29 * nb) shr 8
+                    if (abs(yC - yN) < 22) {
+                        sumU += (nb - yN)
+                        sumV += (nr - yN)
+                        cnt++
+                    }
+                }
+
+                val outR = (yC + sumV / cnt).coerceIn(0, 255)
+                val outB = (yC + sumU / cnt).coerceIn(0, 255)
+                val outG = ((yC * 256 - 77 * outR - 29 * outB) / 150).coerceIn(0, 255)
+                dst[idx] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
+            }
+        }
+        for (x in 0 until w) {
+            dst[x] = src[x]
+            dst[(h - 1) * w + x] = src[(h - 1) * w + x]
+        }
+        for (y in 0 until h) {
+            dst[y * w] = src[y * w]
+            dst[y * w + (w - 1)] = src[y * w + (w - 1)]
+        }
+
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(dst, 0, w, 0, 0, w, h)
+        return out
+    }
+
+    private fun alignAndMergeBurstSafe(base: Bitmap, extras: List<Bitmap>): Bitmap {
+        val w = base.width
+        val h = base.height
+        val total = w * h
+        val basePx = IntArray(total)
+        base.getPixels(basePx, 0, w, 0, 0, w, h)
+
+        val accR = IntArray(total) { (basePx[it] ushr 16) and 0xFF }
+        val accG = IntArray(total) { (basePx[it] ushr 8) and 0xFF }
+        val accB = IntArray(total) { basePx[it] and 0xFF }
+        val accW = ByteArray(total) { 2 }
+
+        val patchSize = min(120, min(w, h) / 3)
+        val cx = w / 2 - patchSize / 2
+        val cy = h / 2 - patchSize / 2
+        val extPx = IntArray(total)
+        var mergedAny = false
+
+        for (extra in extras) {
+            if (extra.width != w || extra.height != h) continue
+            extra.getPixels(extPx, 0, w, 0, 0, w, h)
+
+            var bestDx = 0
+            var bestDy = 0
+            var bestSad = Long.MAX_VALUE
+            var samples = 0
+
+            for (dy in -8..8 step 2) {
+                for (dx in -8..8 step 2) {
+                    var sad = 0L
+                    var cnt = 0
+                    for (py in 0 until patchSize step 4) {
+                        val rowBase = (cy + py) * w
+                        val rowExt = (cy + py + dy) * w
+                        for (px in 0 until patchSize step 4) {
+                            val bVal = basePx[rowBase + cx + px]
+                            val eVal = extPx[rowExt + cx + px + dx]
+                            sad += abs(((bVal ushr 8) and 0xFF) - ((eVal ushr 8) and 0xFF))
+                            cnt++
+                        }
+                    }
+                    if (sad < bestSad) {
+                        bestSad = sad
+                        bestDx = dx
+                        bestDy = dy
+                        samples = cnt
+                    }
+                }
+            }
+
+            // Se la scena si è mossa troppo (SAD medio > 14), scarta questo frame: zero ghosting!
+            if (samples == 0 || (bestSad / samples) > 14) continue
+            mergedAny = true
+
+            for (y in 8 until h - 8) {
+                val rowB = y * w
+                val rowE = (y + bestDy) * w
+                for (x in 8 until w - 8) {
+                    val idxB = rowB + x
+                    val idxE = rowE + (x + bestDx)
+                    val bp = basePx[idxB]
+                    val ep = extPx[idxE]
+
+                    val br = (bp ushr 16) and 0xFF
+                    val bg = (bp ushr 8) and 0xFF
+                    val bb = bp and 0xFF
+
+                    val er = (ep ushr 16) and 0xFF
+                    val eg = (ep ushr 8) and 0xFF
+                    val eb = ep and 0xFF
+
+                    if ((abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3 < 14) {
+                        accR[idxB] += er
+                        accG[idxB] += eg
+                        accB[idxB] += eb
+                        accW[idxB] = (accW[idxB] + 1).toByte()
+                    }
+                }
+            }
+        }
+
+        if (!mergedAny) return base
+
+        for (i in basePx.indices) {
+            val weight = accW[i].toInt() and 0xFF
+            val r = (accR[i] / weight).coerceIn(0, 255)
+            val g = (accG[i] / weight).coerceIn(0, 255)
+            val b = (accB[i] / weight).coerceIn(0, 255)
+            basePx[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(basePx, 0, w, 0, 0, w, h)
+        return out
+    }
+
+    private fun applyDigitalCrop(bmp: Bitmap, factor: Float): Bitmap {
+        val f = factor.coerceIn(1.0f, 4.0f)
+        val newW = (bmp.width / f).toInt().coerceAtLeast(256)
+        val newH = (bmp.height / f).toInt().coerceAtLeast(256)
+        val sx = (bmp.width - newW) / 2
+        val sy = (bmp.height - newH) / 2
+        val crop = Bitmap.createBitmap(bmp, sx, sy, newW, newH)
+        val upscaled = Bitmap.createScaledBitmap(crop, bmp.width, bmp.height, true)
+        crop.recycle()
+        return upscaled
     }
 
     private fun scaleToMaxSide(bmp: Bitmap, maxSide: Int): Bitmap {
@@ -732,155 +655,18 @@ class NeuralSuperResEngine(private val context: Context) {
         )
     }
 
-    private fun filterChromaAndNoise(bitmap: Bitmap, chromaPasses: Int, lumaPasses: Int): Bitmap {
-        val w = bitmap.width
-        val h = bitmap.height
-
-        var src = IntArray(w * h)
-        var dst = IntArray(w * h)
-        bitmap.getPixels(src, 0, w, 0, 0, w, h)
-
-        repeat(chromaPasses.coerceIn(0, 2)) {
-            for (y in 1 until h - 1) {
-                val row = y * w
-                for (x in 1 until w - 1) {
-                    val idx = row + x
-                    val c = src[idx]
-                    val r = (c ushr 16) and 0xFF
-                    val g = (c ushr 8) and 0xFF
-                    val b = c and 0xFF
-                    val yCenter = (77 * r + 150 * g + 29 * b) shr 8
-
-                    var sumU = (b - yCenter) * 2
-                    var sumV = (r - yCenter) * 2
-                    var cnt = 2
-
-                    val offsets = intArrayOf(-w - 1, -w, -w + 1, -1, 1, w - 1, w, w + 1)
-                    for (off in offsets) {
-                        val n = src[idx + off]
-                        val nr = (n ushr 16) and 0xFF
-                        val ng = (n ushr 8) and 0xFF
-                        val nb = n and 0xFF
-                        val yN = (77 * nr + 150 * ng + 29 * nb) shr 8
-                        if (abs(yCenter - yN) < 28) {
-                            sumU += (nb - yN)
-                            sumV += (nr - yN)
-                            cnt++
-                        }
-                    }
-
-                    val outR = (yCenter + sumV / cnt).coerceIn(0, 255)
-                    val outB = (yCenter + sumU / cnt).coerceIn(0, 255)
-                    val outG = ((yCenter * 256 - 77 * outR - 29 * outB) / 150).coerceIn(0, 255)
-                    dst[idx] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
-                }
-            }
-            copyBorders(src, dst, w, h)
-            val tmp = src; src = dst; dst = tmp
-        }
-
-        repeat(lumaPasses.coerceIn(0, 1)) {
-            for (y in 1 until h - 1) {
-                val row = y * w
-                for (x in 1 until w - 1) {
-                    val idx = row + x
-                    val c = src[idx]
-                    val cr = (c ushr 16) and 0xFF
-                    val cg = (c ushr 8) and 0xFF
-                    val cb = c and 0xFF
-
-                    var sumR = cr * 3
-                    var sumG = cg * 3
-                    var sumB = cb * 3
-                    var cnt = 3
-
-                    val offsets = intArrayOf(-w - 1, -w, -w + 1, -1, 1, w - 1, w, w + 1)
-                    for (off in offsets) {
-                        val n = src[idx + off]
-                        val nr = (n ushr 16) and 0xFF
-                        val ng = (n ushr 8) and 0xFF
-                        val nb = n and 0xFF
-                        if ((abs(cr - nr) + abs(cg - ng) + abs(cb - nb)) / 3 < 18) {
-                            sumR += nr
-                            sumG += ng
-                            sumB += nb
-                            cnt++
-                        }
-                    }
-                    dst[idx] = (0xFF shl 24) or
-                        ((sumR / cnt).coerceIn(0, 255) shl 16) or
-                        ((sumG / cnt).coerceIn(0, 255) shl 8) or
-                        (sumB / cnt).coerceIn(0, 255)
-                }
-            }
-            copyBorders(src, dst, w, h)
-            val tmp = src; src = dst; dst = tmp
-        }
-
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(src, 0, w, 0, 0, w, h)
-        return out
-    }
-
-    private fun applyMultiScaleDetail(bitmap: Bitmap, gain: Float): Bitmap {
-        if (gain <= 0.02f) return bitmap
-        val w = bitmap.width
-        val h = bitmap.height
-        val small = Bitmap.createScaledBitmap(bitmap, max(1, w / 3), max(1, h / 3), true)
-        val blur = Bitmap.createScaledBitmap(small, w, h, true)
-        small.recycle()
-
-        val src = IntArray(w * h)
-        val blr = IntArray(w * h)
-        bitmap.getPixels(src, 0, w, 0, 0, w, h)
-        blur.getPixels(blr, 0, w, 0, 0, w, h)
-        blur.recycle()
-
-        for (i in src.indices) {
-            val s = src[i]
-            val b = blr[i]
-            val sr = (s ushr 16) and 0xFF
-            val sg = (s ushr 8) and 0xFF
-            val sb = s and 0xFF
-
-            val lum = (77 * sr + 150 * sg + 29 * sb) shr 8
-            val lumProtection = when {
-                lum > 224 -> ((255 - lum) / 31f).coerceIn(0.20f, 1.0f)
-                lum < 18 -> (lum / 18f).coerceIn(0.30f, 1.0f)
-                else -> 1.0f
-            }
-            val effGain = gain * lumProtection
-
-            val dR = (sr - ((b ushr 16) and 0xFF)).coerceIn(-24, 24)
-            val dG = (sg - ((b ushr 8) and 0xFF)).coerceIn(-24, 24)
-            val dB = (sb - (b and 0xFF)).coerceIn(-24, 24)
-
-            val nr = (sr + dR * effGain).toInt().coerceIn(0, 255)
-            val ng = (sg + dG * effGain).toInt().coerceIn(0, 255)
-            val nb = (sb + dB * effGain).toInt().coerceIn(0, 255)
-            src[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
-        }
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(src, 0, w, 0, 0, w, h)
-        return out
-    }
-
-    private fun applyTrueColorToneCurve(bitmap: Bitmap, strength: Float): Bitmap {
+    private fun applySubtleFilmicCurve(bitmap: Bitmap, strength: Float): Bitmap {
         val w = bitmap.width
         val h = bitmap.height
         val pixels = IntArray(w * h)
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        val curve = 0.025 * strength
-        val lift = 2.0 * strength
-
+        val curve = 0.022 * strength
         val lut = IntArray(256)
         for (v in 0..255) {
             val norm = v / 255.0
             val sCurve = norm - curve * sin(2.0 * Math.PI * norm)
-            val shadowLift = (lift / 255.0) * (1.0 - norm) * (1.0 - norm) * (1.0 - norm)
-            val mapped = sCurve + shadowLift
-            val safe = if (mapped > 0.88) 0.88 + (mapped - 0.88) * 0.88 else mapped
+            val safe = if (sCurve > 0.89) 0.89 + (sCurve - 0.89) * 0.88 else sCurve
             lut[v] = (safe * 255.0).toInt().coerceIn(0, 255)
         }
         for (i in pixels.indices) {
@@ -893,16 +679,5 @@ class NeuralSuperResEngine(private val context: Context) {
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         out.setPixels(pixels, 0, w, 0, 0, w, h)
         return out
-    }
-
-    private fun copyBorders(src: IntArray, dst: IntArray, w: Int, h: Int) {
-        for (x in 0 until w) {
-            dst[x] = src[x]
-            dst[(h - 1) * w + x] = src[(h - 1) * w + x]
-        }
-        for (y in 0 until h) {
-            dst[y * w] = src[y * w]
-            dst[y * w + (w - 1)] = src[y * w + (w - 1)]
-        }
     }
 }

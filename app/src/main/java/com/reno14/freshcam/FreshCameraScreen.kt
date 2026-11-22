@@ -21,6 +21,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -72,6 +73,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -135,11 +137,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
     var focusRing by remember { mutableStateOf<Offset?>(null) }
     var flashPulse by remember { mutableStateOf(false) }
 
-    // Ghiera rotante zoom stile stock (compare al tocco/trascinamento e scompare dopo 2s di inattività)
     var showZoomDial by remember { mutableStateOf(false) }
     var dialHideJob by remember { mutableStateOf<Job?>(null) }
-
-    // Miniatura reale dell'ultima foto nel pulsante Galleria
     var lastThumbBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     val engine = remember(context, lifecycleOwner) { FreshCameraEngine(context, lifecycleOwner) }
@@ -148,7 +147,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         showZoomDial = true
         dialHideJob?.cancel()
         dialHideJob = scope.launch {
-            delay(2200)
+            delay(2500)
             showZoomDial = false
         }
     }
@@ -165,7 +164,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         )
     }
 
-    // Carica la miniatura reale quando cambia lastCapturedUri (e all'avvio dall'ultima foto in Galleria)
     LaunchedEffect(state.lastCapturedUri) {
         val uriStr = state.lastCapturedUri
         val loaded = withContext(Dispatchers.IO) {
@@ -176,23 +174,20 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         }
     }
 
+    // Rilevamento lenti su thread IO (mai sul Main Thread -> zero blocchi all'avvio)
     LaunchedEffect(Unit) {
-        val lenses = engine.discoverLenses()
-        val hasModel = engine.checkNeuralModelReady()
+        val lenses = withContext(Dispatchers.IO) { engine.discoverLenses() }
         val hasLoc = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         state = state.copy(
             detectedLenses = lenses,
-            isNeuralModelReady = hasModel,
-            loadedModelName = engine.getLoadedModelName(),
-            activeAccelerator = engine.getActiveAccelerator(),
             hasLocationPermission = hasLoc
         )
     }
 
     LaunchedEffect(state.bannerMessage) {
         if (state.bannerMessage != null) {
-            delay(3500)
+            delay(3200)
             state = state.copy(bannerMessage = null)
         }
     }
@@ -211,22 +206,21 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         }
     }
 
+    // Re-bind della fotocamera con DEBOUNCE e solo per parametri strutturali (EV e Flash vanno live senza unbind!)
     LaunchedEffect(
         previewView,
         state.activeLens,
         state.captureFormat,
         state.videoResolution,
-        state.jpegQuality,
         state.stabilizationEnabled,
         state.isoValue,
         state.shutterSpeedDenom,
-        state.evCompensation,
         state.focusMode,
         state.manualFocusDistance,
-        state.shootingMode,
-        state.flashMode
+        state.shootingMode
     ) {
         val pv = previewView ?: return@LaunchedEffect
+        delay(90)
         engine.bind(
             previewView = pv,
             state = state,
@@ -239,24 +233,53 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         )
     }
 
+    // Aggiornamenti LIVE senza riavviare la fotocamera (elimina i freeze!)
+    LaunchedEffect(state.evCompensation) {
+        if (state.captureFormat != CaptureFormat.PRO) {
+            engine.applyExposureCompensation(state.evCompensation)
+        }
+    }
+
+    LaunchedEffect(state.flashMode) {
+        engine.applyFlashLive(state.flashMode)
+    }
+
     LaunchedEffect(state.lensZoomRatio) {
         engine.setZoom(state.lensZoomRatio)
     }
 
+    val latestState by rememberUpdatedState(state)
+
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // Mirino Fotocamera
+        // Mirino Fotocamera con Tap-to-Focus + Pinch-to-Zoom fluido
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(state.focusMode) {
+                .pointerInput(Unit) {
                     detectTapGestures { offset ->
                         focusRing = offset
-                        if (state.focusMode == FocusMode.AI_LOCK) {
+                        val st = latestState
+                        if (st.focusMode == FocusMode.AI_LOCK) {
                             engine.applyFocusPoint(offset.x, offset.y, size.width.toFloat(), size.height.toFloat(), keepLocked = true)
-                            state = state.copy(isSubjectLocked = true, bannerMessage = "AI Lock agganciato")
-                        } else if (state.focusMode == FocusMode.AUTO) {
+                            state = st.copy(isSubjectLocked = true, bannerMessage = "AI Lock agganciato")
+                        } else if (st.focusMode == FocusMode.AUTO) {
                             engine.applyFocusPoint(offset.x, offset.y, size.width.toFloat(), size.height.toFloat(), keepLocked = false)
-                            state = state.copy(isSubjectLocked = false, bannerMessage = "Autofocus sul punto")
+                            state = st.copy(isSubjectLocked = false, bannerMessage = "Autofocus sul punto")
+                        }
+                    }
+                }
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, _, zoomChange, _ ->
+                        if (abs(zoomChange - 1f) > 0.008f && latestState.activeLens != LensType.FRONT) {
+                            val st = latestState
+                            val nextZoom = (st.displayZoom * zoomChange).coerceIn(0.6f, 120.0f)
+                            val (resolvedLens, resolvedRatio) = resolveLensAndRatio(nextZoom, st.activeLens)
+                            pingZoomDial()
+                            state = st.copy(
+                                displayZoom = nextZoom,
+                                activeLens = resolvedLens,
+                                lensZoomRatio = resolvedRatio
+                            )
                         }
                     }
                 }
@@ -306,7 +329,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.4f)))
             }
 
-            // Conto alla rovescia Autoscatto al centro dello schermo
             if (state.countdownRemaining > 0) {
                 Box(
                     modifier = Modifier.fillMaxSize(),
@@ -322,7 +344,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // BARRA SUPERIORE PULITA: tasto Impostazioni SEMPRE fisso in alto a destra!
+        // BARRA SUPERIORE
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -336,7 +358,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     .horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // 1. Flash
                 IconButton(
                     onClick = {
                         val next = when (state.flashMode) {
@@ -359,7 +380,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
-                // 2. Autoscatto (Timer Off / 3s / 5s / 10s)
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
@@ -394,7 +414,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // 3. UNICO TASTO AI (Off / Locale Bassa-Media-Alta / Cloud Bassa-Media-Alta)
+                // UNICO TASTO AI (Off / Locale Bassa-Media-Alta / Cloud Bassa-Media-Alta)
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
@@ -427,7 +447,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // 4. Profilo Colore & Formato
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
@@ -446,7 +465,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // 5. Fuoco
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
@@ -465,7 +483,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
             Spacer(modifier = Modifier.width(6.dp))
 
-            // TASTO IMPOSTAZIONI FISSO E SEMPRE VISIBILE (Foto & Video)
             IconButton(
                 onClick = { sheet = SheetPage.SETTINGS },
                 modifier = Modifier
@@ -526,7 +543,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 .padding(top = 6.dp, bottom = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // GHIERA ROTANTE ZOOM STILE STOCK (compare quando usi lo zoom e scompare da sola)
+            // GHIERA ROTANTE ZOOM FLUIDA (fix pointerInput(Unit) -> reattiva al 100%)
             if (state.activeLens != LensType.FRONT) {
                 AnimatedVisibility(
                     visible = showZoomDial,
@@ -548,7 +565,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
-                // Preset rapidi zoom fino a 120x (toccare apre anche la ghiera rotante per regolazione fine)
                 val presets = listOf(
                     Pair("0.6x", 0.6f),
                     Pair("1x", 1.0f),
@@ -590,7 +606,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 }
             }
 
-            // Modalità pulite: Foto · Video · Ritratto · Notte
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -615,13 +630,12 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Pulsanti inferiori: Anteprima Galleria reale · Scatto · Cambio Camera
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 28.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // ANTEPRIMA REALE DELL'ULTIMA FOTO NELLA GALLERIA
+                // Anteprima reale dell'ultima foto
                 Box(
                     modifier = Modifier
                         .size(48.dp)
@@ -648,23 +662,22 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
                 }
 
-                // PULSANTE SCATTO (supporta Autoscatto Timer)
+                // Pulsante Scatto con protezione anti-doppio-scatto (previene i blocchi di memoria)
                 Box(
                     modifier = Modifier
                         .size(74.dp)
                         .clip(CircleShape)
-                        .border(4.dp, Color.White, CircleShape)
+                        .border(4.dp, if (state.isCapturing) Color.Gray else Color.White, CircleShape)
                         .padding(6.dp)
                         .clip(CircleShape)
                         .background(
-                            if (state.shootingMode == ShootingMode.VIDEO) {
-                                if (state.isRecordingVideo) Color.Red else Color(0xFFFF5252)
-                            } else {
-                                state.profile.accentColor
+                            when {
+                                state.isCapturing -> Color.Gray
+                                state.shootingMode == ShootingMode.VIDEO -> if (state.isRecordingVideo) Color.Red else Color(0xFFFF5252)
+                                else -> state.profile.accentColor
                             }
                         )
-                        .clickable {
-                            if (state.countdownRemaining > 0) return@clickable
+                        .clickable(enabled = !state.isCapturing && state.countdownRemaining == 0) {
                             if (state.shootingMode == ShootingMode.VIDEO) {
                                 engine.toggleVideo(
                                     state = state,
@@ -674,7 +687,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             } else {
                                 val triggerCapture = {
                                     flashPulse = true
-                                    val snap = state
+                                    val snap = state.copy(isCapturing = true)
+                                    state = snap
                                     engine.shootInstant(
                                         snapshot = snap,
                                         onStatus = { busyMsg ->
@@ -682,6 +696,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                                         },
                                         onResult = { uri, msg ->
                                             state = state.copy(
+                                                isCapturing = false,
                                                 persistentStatus = null,
                                                 lastCapturedUri = uri ?: state.lastCapturedUri,
                                                 bannerMessage = msg
@@ -718,7 +733,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
-                // CAMBIO CAMERA
                 Box(
                     modifier = Modifier
                         .size(48.dp)
@@ -748,7 +762,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // MENU UNIFICATO AI (7 stati in un solo posto pulito)
+        // MENU UNIFICATO AI
         if (sheet == SheetPage.AI_SELECTOR) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -756,8 +770,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 contentColor = Color.White
             ) {
                 Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)) {
-                    Text("Motore AI (Locale & Cloud)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                    Text("Unico selettore: Off, Locale (MediaTek NNAPI) oppure Cloud", fontSize = 12.sp, color = Color.White.copy(alpha = 0.65f))
+                    Text("Motore AI v13 (Computazionale & Cloud)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    Text("Locale: Edge-Preserving su luminanza (zero impastamento) · Cloud: Swin2SR Classical", fontSize = 12.sp, color = Color.White.copy(alpha = 0.65f))
                     Spacer(modifier = Modifier.height(12.dp))
 
                     FilterChip(
@@ -770,7 +784,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("AI Locale (sul telefono · MediaTek APU 780)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
+                    Text("AI Locale (Micro-Contrasto + HDR Naturale)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(UnifiedAiPreset.LOCAL_LOW, UnifiedAiPreset.LOCAL_MED, UnifiedAiPreset.LOCAL_HIGH).forEach { preset ->
@@ -786,7 +800,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("AI in Cloud (Ricostruzione remota avanzata)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB39DDB))
+                    Text("AI in Cloud (Swin2SR Classical · Fusione Radiale)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB39DDB))
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(UnifiedAiPreset.CLOUD_LOW, UnifiedAiPreset.CLOUD_MED, UnifiedAiPreset.CLOUD_HIGH).forEach { preset ->
@@ -896,7 +910,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // IMPOSTAZIONI COMPLETE FOTO & VIDEO
+        // IMPOSTAZIONI FOTO, VIDEO & CLOUD
         if (sheet == SheetPage.SETTINGS) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -909,8 +923,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         .verticalScroll(rememberScrollState())
                         .padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
-                    Text("Impostazioni Foto & Video (v12)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                    Text("NPU: ${state.activeAccelerator} · Zoom fino a 120x", fontSize = 12.sp, color = Color(0xFF4FC3F7))
+                    Text("Impostazioni Foto & Video (v13)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("Motore Computazionale Stabile · Zoom fino a 120x", fontSize = 12.sp, color = Color(0xFF4FC3F7))
 
                     Spacer(modifier = Modifier.height(14.dp))
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
@@ -939,7 +953,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                     ToggleRow(
                         title = "Stabilizzazione Ottica + Elettronica (OIS + EIS)",
-                        subtitle = "Sfrutta al massimo l'OIS su Principale 50MP e Tele 50MP in foto e video",
+                        subtitle = "OIS al massimo su Principale 50MP e Tele 50MP in foto e video",
                         checked = state.stabilizationEnabled,
                         onChange = { state = state.copy(stabilizationEnabled = it) }
                     )
@@ -952,7 +966,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
 
                     ToggleRow(
-                        title = "Bilanciamento Tonale Colore Reale",
+                        title = "Curva Tonale Cinematografica",
                         subtitle = "Protegge le alte luci mantenendo fedeltà cromatica",
                         checked = state.postSavePolishEnabled,
                         onChange = { state = state.copy(postSavePolishEnabled = it) }
@@ -995,8 +1009,21 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    Text("CONFIGURAZIONE CLOUD AI", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB39DDB))
+                    Text("MODELLO CLOUD AI (FUSIONE RADIALE)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB39DDB))
                     Spacer(modifier = Modifier.height(6.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        CloudModelPreset.entries.forEach { preset ->
+                            FilterChip(
+                                selected = state.cloudModelPreset == preset,
+                                onClick = {
+                                    val newUrl = if (preset == CloudModelPreset.CUSTOM) state.cloudEndpointUrl else preset.url
+                                    state = state.copy(cloudModelPreset = preset, cloudEndpointUrl = newUrl)
+                                },
+                                label = { Text(preset.label, fontSize = 12.sp) }
+                            )
+                        }
+                    }
+
                     OutlinedTextField(
                         value = state.cloudApiKey,
                         onValueChange = { state = state.copy(cloudApiKey = it) },
@@ -1006,7 +1033,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                     OutlinedTextField(
                         value = state.cloudEndpointUrl,
-                        onValueChange = { state = state.copy(cloudEndpointUrl = it) },
+                        onValueChange = { state = state.copy(cloudEndpointUrl = it, cloudModelPreset = CloudModelPreset.CUSTOM) },
                         label = { Text("URL Endpoint Cloud SR") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
@@ -1028,8 +1055,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 }
 
 /**
- * Selettore di zoom a ghiera rotante (stile fotocamera stock Oppo) fino a 120x.
- * Scala logaritmica fluida così da avere controllo preciso tra 0.6x–7x e scorrevole fino a 120x.
+ * Ghiera rotante zoom FLUIDA e REATTIVA (fix bug v12: pointerInput(Unit) + rememberUpdatedState).
  */
 @Composable
 private fun RotatingZoomDial(
@@ -1042,18 +1068,22 @@ private fun RotatingZoomDial(
     val lnMin = ln(minZ.toDouble())
     val lnMax = ln(maxZ.toDouble())
 
+    val latestZoom by rememberUpdatedState(currentZoom)
+    val latestOnChange by rememberUpdatedState(onZoomChange)
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(78.dp)
-            .pointerInput(currentZoom) {
+            .height(86.dp)
+            .pointerInput(Unit) {
                 detectHorizontalDragGestures { change, dragAmount ->
                     change.consume()
-                    val norm = ((ln(currentZoom.coerceIn(minZ, maxZ).toDouble()) - lnMin) / (lnMax - lnMin)).toFloat()
-                    val delta = -dragAmount / 520f
+                    val cur = latestZoom.coerceIn(minZ, maxZ)
+                    val norm = ((ln(cur.toDouble()) - lnMin) / (lnMax - lnMin)).toFloat()
+                    val delta = -dragAmount / 320f
                     val nextNorm = (norm + delta).coerceIn(0f, 1f)
                     val nextZoom = exp(lnMin + nextNorm * (lnMax - lnMin)).toFloat().coerceIn(minZ, maxZ)
-                    onZoomChange(nextZoom)
+                    latestOnChange(nextZoom)
                 }
             },
         contentAlignment = Alignment.BottomCenter
@@ -1061,20 +1091,20 @@ private fun RotatingZoomDial(
         Canvas(modifier = Modifier.fillMaxSize()) {
             val cx = size.width / 2f
             val radius = size.width * 0.72f
-            val cy = radius + 24f
+            val cy = radius + 28f
 
             val norm = ((ln(currentZoom.coerceIn(minZ, maxZ).toDouble()) - lnMin) / (lnMax - lnMin)).toFloat()
+            val phase = (norm * 44f) % 2.2f
 
-            // Tacche graduate lungo l'arco che ruotano con lo zoom
-            for (i in -18..18) {
-                val angleDeg = i * 2.2f - (norm * 40f % 2.2f)
+            for (i in -20..20) {
+                val angleDeg = i * 2.2f - phase
                 val rad = (angleDeg - 90.0) * PI / 180.0
                 val isMajor = (i % 5 == 0)
-                val innerR = radius - if (isMajor) 22f else 12f
+                val innerR = radius - if (isMajor) 24f else 13f
                 val start = Offset(cx + (radius * cos(rad)).toFloat(), cy + (radius * sin(rad)).toFloat())
                 val end = Offset(cx + (innerR * cos(rad)).toFloat(), cy + (innerR * sin(rad)).toFloat())
                 drawLine(
-                    color = if (isMajor) Color.White.copy(alpha = 0.85f) else Color.White.copy(alpha = 0.35f),
+                    color = if (isMajor) Color.White.copy(alpha = 0.90f) else Color.White.copy(alpha = 0.35f),
                     start = start,
                     end = end,
                     strokeWidth = if (isMajor) 2.5f else 1.5f,
@@ -1082,11 +1112,10 @@ private fun RotatingZoomDial(
                 )
             }
 
-            // Indicatore centrale fisso
             drawLine(
                 color = accentColor,
-                start = Offset(cx, 18f),
-                end = Offset(cx, 48f),
+                start = Offset(cx, 22f),
+                end = Offset(cx, 54f),
                 strokeWidth = 4f,
                 cap = StrokeCap.Round
             )
@@ -1096,14 +1125,14 @@ private fun RotatingZoomDial(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .clip(RoundedCornerShape(12.dp))
-                .background(Color.Black.copy(alpha = 0.75f))
+                .background(Color.Black.copy(alpha = 0.78f))
                 .border(1.dp, accentColor, RoundedCornerShape(12.dp))
-                .padding(horizontal = 10.dp, vertical = 2.dp)
+                .padding(horizontal = 12.dp, vertical = 2.dp)
         ) {
             Text(
                 text = "${String.format(Locale.US, "%.1f", currentZoom)}x",
                 color = accentColor,
-                fontSize = 13.sp,
+                fontSize = 14.sp,
                 fontWeight = FontWeight.Bold
             )
         }

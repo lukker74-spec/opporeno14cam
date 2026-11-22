@@ -16,14 +16,14 @@ enum class CameraProfile(
     val warmth: Float,
     val shadowLift: Float
 ) {
-    NATURAL("naturale", "Naturale", Color(0xFF4FC3F7), 1.02f, 1.01f, 0.0f, 0.005f),
-    VIVID("vivido", "Vivido", Color(0xFFFFA726), 1.11f, 1.24f, 0.02f, 0.01f),
+    NATURAL("naturale", "Naturale", Color(0xFF4FC3F7), 1.02f, 1.01f, 0.0f, 0.0f),
+    VIVID("vivido", "Vivido", Color(0xFFFFA726), 1.10f, 1.22f, 0.015f, 0.005f),
     BW("bianco_nero", "Bianco e Nero", Color(0xFFE0E0E0), 1.18f, 0.0f, 0.0f, -0.01f),
     LEICA("leica", "Leica", Color(0xFFE53935), 1.08f, 0.99f, 0.015f, 0.0f),
-    ZEISS("zeiss", "Zeiss", Color(0xFF1E88E5), 1.05f, 1.02f, -0.01f, 0.01f),
-    HASSELBLAD("hasselblad", "Hasselblad", Color(0xFFFF7043), 1.04f, 1.04f, 0.02f, 0.01f),
-    PIXEL("pixel", "Pixel", Color(0xFF66BB6A), 1.06f, 1.05f, 0.0f, 0.02f),
-    KODAK("kodak", "Kodak", Color(0xFFFFCA28), 1.03f, 1.06f, 0.035f, 0.015f);
+    ZEISS("zeiss", "Zeiss", Color(0xFF1E88E5), 1.05f, 1.02f, -0.01f, 0.005f),
+    HASSELBLAD("hasselblad", "Hasselblad", Color(0xFFFF7043), 1.04f, 1.04f, 0.02f, 0.005f),
+    PIXEL("pixel", "Pixel", Color(0xFF66BB6A), 1.06f, 1.05f, 0.0f, 0.015f),
+    KODAK("kodak", "Kodak", Color(0xFFFFCA28), 1.03f, 1.06f, 0.03f, 0.01f);
 
     fun toColorMatrix(strength: Float = 1.0f, brightnessOffset: Float = 0.0f): ColorMatrix {
         val c = 1f + (contrast - 1f) * strength
@@ -42,8 +42,8 @@ enum class CameraProfile(
         )
 
         val translate = (1f - c) * 128f + lift
-        val warmthR = (w * 14f).coerceIn(-18f, 18f)
-        val warmthB = (-w * 14f).coerceIn(-18f, 18f)
+        val warmthR = (w * 12f).coerceIn(-16f, 16f)
+        val warmthB = (-w * 12f).coerceIn(-16f, 16f)
 
         val cwMatrix = ColorMatrix(
             floatArrayOf(
@@ -68,16 +68,12 @@ enum class CameraProfile(
     }
 }
 
-/**
- * Unico selettore AI unificato (7 stati):
- * Off · Locale (Bassa / Media / Alta) · Cloud (Bassa / Media / Alta)
- */
 enum class UnifiedAiPreset(
     val shortBadge: String,
     val fullLabel: String,
     val isEnabled: Boolean,
     val isCloud: Boolean,
-    val level: Int // 0 = off, 1 = bassa, 2 = media, 3 = alta
+    val level: Int
 ) {
     OFF("AI Off", "AI Disattivata", false, false, 0),
     LOCAL_LOW("AI Bassa", "Locale · Bassa", true, false, 1),
@@ -86,6 +82,21 @@ enum class UnifiedAiPreset(
     CLOUD_LOW("Cloud Bassa", "Cloud · Bassa", true, true, 1),
     CLOUD_MED("Cloud Media", "Cloud · Media", true, true, 2),
     CLOUD_HIGH("Cloud Alta", "Cloud · Alta", true, true, 3)
+}
+
+enum class CloudModelPreset(val label: String, val url: String) {
+    SWIN2SR_CLASSICAL_X2(
+        "Swin2SR Classical x2 (Fedele · Consigliato)",
+        "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-classical-sr-x2-64"
+    ),
+    SWIN2SR_LIGHT_X2(
+        "Swin2SR Light x2 (Veloce & Pulito)",
+        "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-lightweight-x2-64"
+    ),
+    CUSTOM(
+        "Endpoint Personalizzato",
+        ""
+    )
 }
 
 enum class TimerMode(val seconds: Int, val label: String) {
@@ -134,12 +145,6 @@ enum class FlashMode(val label: String) {
     TORCH("Torcia")
 }
 
-enum class HdrMode(val label: String) {
-    OFF("No HDR"),
-    NATURAL("HDR Naturale"),
-    AUTO("HDR Auto")
-}
-
 data class PhysicalLensInfo(
     val cameraId: String,
     val lensType: LensType,
@@ -150,10 +155,11 @@ data class FreshCamState(
     val profile: CameraProfile = CameraProfile.NATURAL,
     val captureFormat: CaptureFormat = CaptureFormat.NORMAL,
     val aiPreset: UnifiedAiPreset = UnifiedAiPreset.LOCAL_MED,
+    val cloudModelPreset: CloudModelPreset = CloudModelPreset.SWIN2SR_CLASSICAL_X2,
     val timerMode: TimerMode = TimerMode.OFF,
     val countdownRemaining: Int = 0,
     val videoResolution: VideoResolution = VideoResolution.UHD_4K,
-    val jpegQuality: Int = 99,
+    val jpegQuality: Int = 98,
     val activeLens: LensType = LensType.MAIN_50MP,
     val detectedLenses: List<PhysicalLensInfo> = emptyList(),
     val focusMode: FocusMode = FocusMode.AI_LOCK,
@@ -161,7 +167,6 @@ data class FreshCamState(
     val manualFocusDistance: Float = 0.5f,
     val shootingMode: ShootingMode = ShootingMode.PHOTO,
     val flashMode: FlashMode = FlashMode.AUTO,
-    val hdrMode: HdrMode = HdrMode.NATURAL,
     val displayZoom: Float = 1.0f,
     val lensZoomRatio: Float = 1.0f,
     val maxLensZoomRatio: Float = 34.3f,
@@ -172,15 +177,13 @@ data class FreshCamState(
     val shutterSpeedDenom: Int = 125,
     val stabilizationEnabled: Boolean = true,
     val cloudApiKey: String = "",
-    val cloudEndpointUrl: String = "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
-    val isNeuralModelReady: Boolean = false,
-    val loadedModelName: String = "Nessuno",
-    val activeAccelerator: String = "CPU",
+    val cloudEndpointUrl: String = CloudModelPreset.SWIN2SR_CLASSICAL_X2.url,
     val postSavePolishEnabled: Boolean = true,
     val gridEnabled: Boolean = true,
     val locationTagEnabled: Boolean = false,
     val hasLocationPermission: Boolean = false,
     val isRecordingVideo: Boolean = false,
+    val isCapturing: Boolean = false,
     val lastCapturedUri: String? = null,
     val bannerMessage: String? = null,
     val persistentStatus: String? = null

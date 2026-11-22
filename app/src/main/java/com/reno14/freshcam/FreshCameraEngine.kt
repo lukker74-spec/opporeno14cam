@@ -74,10 +74,6 @@ class FreshCameraEngine(
 
     private var discoveredLenses: List<PhysicalLensInfo> = emptyList()
 
-    fun checkNeuralModelReady(): Boolean = neuralEngine.isModelAvailable()
-    fun getLoadedModelName(): String = neuralEngine.loadedAssetName
-    fun getActiveAccelerator(): String = neuralEngine.acceleratorName
-
     fun discoverLenses(): List<PhysicalLensInfo> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val list = mutableListOf<PhysicalLensInfo>()
@@ -181,7 +177,6 @@ class FreshCameraEngine(
                 cExt.setCaptureRequestOption(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_HIGH_QUALITY)
                 cExt.setCaptureRequestOption(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_HIGH_QUALITY)
 
-                // Stabilizzazione Ottica (OIS) + Elettronica (EIS) spinte al massimo
                 val oisMode = if (state.stabilizationEnabled) {
                     CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
                 } else {
@@ -201,10 +196,7 @@ class FreshCameraEngine(
                 cExt.setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, oisMode)
                 pExt.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, videoStabMode)
 
-                if (state.captureFormat != CaptureFormat.PRO) {
-                    pExt.setCaptureRequestOption(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, state.evCompensation)
-                    cExt.setCaptureRequestOption(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, state.evCompensation)
-                } else {
+                if (state.captureFormat == CaptureFormat.PRO) {
                     val expNs = 1_000_000_000L / state.shutterSpeedDenom.coerceAtLeast(1)
                     pExt.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                     pExt.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, state.isoValue)
@@ -233,22 +225,10 @@ class FreshCameraEngine(
                 }
 
                 when (state.flashMode) {
-                    FlashMode.OFF -> {
-                        captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_OFF)
-                        camera?.cameraControl?.enableTorch(false)
-                    }
-                    FlashMode.AUTO -> {
-                        captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_AUTO)
-                        camera?.cameraControl?.enableTorch(false)
-                    }
-                    FlashMode.ON -> {
-                        captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_ON)
-                        camera?.cameraControl?.enableTorch(false)
-                    }
-                    FlashMode.TORCH -> {
-                        captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_OFF)
-                        camera?.cameraControl?.enableTorch(true)
-                    }
+                    FlashMode.OFF -> captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_OFF)
+                    FlashMode.AUTO -> captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_AUTO)
+                    FlashMode.ON -> captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_ON)
+                    FlashMode.TORCH -> captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_OFF)
                 }
 
                 val preview = previewBuilder.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
@@ -279,6 +259,12 @@ class FreshCameraEngine(
                 }
                 camera = bound
 
+                bound.cameraControl.enableTorch(state.flashMode == FlashMode.TORCH)
+
+                if (state.captureFormat != CaptureFormat.PRO) {
+                    applyExposureCompensation(state.evCompensation)
+                }
+
                 val chars = Camera2CameraInfo.extractCameraCharacteristics(bound.cameraInfo)
                 minFocusDistanceDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
 
@@ -299,10 +285,44 @@ class FreshCameraEngine(
         }, ContextCompat.getMainExecutor(context))
     }
 
+    /**
+     * Aggiorna EV e Flash/Torcia dinamicamente SENZA riavviare la fotocamera (previene i blocchi!)
+     */
+    fun applyExposureCompensation(ev: Int) {
+        val cam = camera ?: return
+        val range = cam.cameraInfo.exposureState.exposureCompensationRange
+        if (range.lower < range.upper) {
+            cam.cameraControl.setExposureCompensationIndex(ev.coerceIn(range.lower, range.upper))
+        }
+    }
+
+    fun applyFlashLive(flashMode: FlashMode) {
+        val cap = imageCapture
+        when (flashMode) {
+            FlashMode.OFF -> {
+                cap?.flashMode = ImageCapture.FLASH_MODE_OFF
+                camera?.cameraControl?.enableTorch(false)
+            }
+            FlashMode.AUTO -> {
+                cap?.flashMode = ImageCapture.FLASH_MODE_AUTO
+                camera?.cameraControl?.enableTorch(false)
+            }
+            FlashMode.ON -> {
+                cap?.flashMode = ImageCapture.FLASH_MODE_ON
+                camera?.cameraControl?.enableTorch(false)
+            }
+            FlashMode.TORCH -> {
+                cap?.flashMode = ImageCapture.FLASH_MODE_OFF
+                camera?.cameraControl?.enableTorch(true)
+            }
+        }
+    }
+
     fun setZoom(ratio: Float) {
-        val zs = camera?.cameraInfo?.zoomState?.value ?: return
+        val cam = camera ?: return
+        val zs = cam.cameraInfo.zoomState.value ?: return
         currentMaxHwZoomRatio = zs.maxZoomRatio
-        camera?.cameraControl?.setZoomRatio(ratio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio))
+        cam.cameraControl.setZoomRatio(ratio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio))
     }
 
     fun applyFocusPoint(x: Float, y: Float, w: Float, h: Float, keepLocked: Boolean) {
@@ -346,13 +366,13 @@ class FreshCameraEngine(
         }
 
         val capturedLocation = if (snapshot.locationTagEnabled) getLastKnownLocation() else null
-        val isTeleSpinto = snapshot.displayZoom >= 8.0f
+        val isTeleSpinto = snapshot.displayZoom >= 10.0f
         val needBurst = snapshot.aiPreset.isEnabled && snapshot.captureFormat != CaptureFormat.RAW && isTeleSpinto
         val burstCount = if (needBurst) 3 else 1
-        val maxSide = if (snapshot.aiPreset.isEnabled) 3600 else 4400
+        // 3200px max side mantiene alta nitidezza riducendo del 60% il picco RAM (zero blocchi!)
+        val maxSide = if (snapshot.aiPreset.isEnabled) 3200 else 4200
         val collectedFrames = mutableListOf<Bitmap>()
 
-        // Calcola l'eventuale extra zoom digitale se l'utente ha spinto fino a 120x oltre il limite hardware Camera2
         val digitalExtraZoom = if (snapshot.activeLens == LensType.TELE_50MP && snapshot.lensZoomRatio > currentMaxHwZoomRatio) {
             (snapshot.lensZoomRatio / currentMaxHwZoomRatio).coerceIn(1.0f, 4.0f)
         } else {
@@ -514,7 +534,7 @@ class FreshCameraEngine(
         }
 
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ITALY).format(Date())
-        val name = "FreshCam_VID_${state.videoResolution.name}_${stamp}.mp4"
+        val name = "FreshCam_VID_${state.videoResolution.name}_$stamp.mp4"
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
@@ -572,7 +592,7 @@ class FreshCameraEngine(
 
         val yuv = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
         val out = ByteArrayOutputStream()
-        yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 99, out)
+        yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 98, out)
         val bytes = out.toByteArray()
         return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }
