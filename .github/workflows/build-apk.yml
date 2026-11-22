@@ -1,4 +1,4 @@
-name: Build Reno14 FreshCam v8 MediaTek+Cloud APK
+name: Build Reno14 FreshCam v12 ProDial+UnifiedAI APK
 
 on:
   push:
@@ -18,11 +18,11 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Download Fast Mobile Super-Resolution TFLite Model (MediaTek NNAPI Ready)
+      - name: Download Fast TFLite SR Model (MediaTek APU 780 / NNAPI Ready)
         run: |
           mkdir -p app/src/main/assets tmp_model
           if curl -fL "https://huggingface.co/qualcomm/QuickSRNetSmall/resolve/main/QuickSRNetSmall.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
-            echo "Scaricato QuickSRNetSmall.tflite (veloce per NNAPI/MediaTek)"
+            echo "Scaricato QuickSRNetSmall.tflite (MediaTek NNAPI Ready)"
           elif curl -fL "https://huggingface.co/qualcomm/XLSR/resolve/main/XLSR.tflite" -o app/src/main/assets/superres.tflite && [ -s app/src/main/assets/superres.tflite ]; then
             echo "Scaricato XLSR.tflite"
           else
@@ -49,5 +49,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reno14-FreshCam-v8-MediaTekCloud-APK
+          name: Reno14-FreshCam-v12-ProDial-APK
           path: app/build/outputs/apk/debug/app-debug.apk
