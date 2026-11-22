@@ -16,83 +16,19 @@ enum class CameraProfile(
     val warmth: Float,
     val shadowLift: Float
 ) {
-    NORMAL(
-        id = "normal",
-        displayName = "Normale",
-        accentColor = Color(0xFF4FC3F7),
-        contrast = 1.06f,
-        saturation = 1.06f,
-        warmth = 0.01f,
-        shadowLift = 0.05f
-    ),
-    LEICA(
-        id = "leica",
-        displayName = "Leica",
-        accentColor = Color(0xFFE53935),
-        contrast = 1.15f,
-        saturation = 0.95f,
-        warmth = 0.04f,
-        shadowLift = 0.01f
-    ),
-    ZEISS(
-        id = "zeiss",
-        displayName = "Zeiss",
-        accentColor = Color(0xFF1E88E5),
-        contrast = 1.10f,
-        saturation = 1.04f,
-        warmth = -0.02f,
-        shadowLift = 0.04f
-    ),
-    HASSELBLAD(
-        id = "hasselblad",
-        displayName = "Hasselblad",
-        accentColor = Color(0xFFFF7043),
-        contrast = 1.07f,
-        saturation = 1.06f,
-        warmth = 0.05f,
-        shadowLift = 0.05f
-    ),
-    PIXEL(
-        id = "pixel",
-        displayName = "Pixel",
-        accentColor = Color(0xFF66BB6A),
-        contrast = 1.12f,
-        saturation = 1.07f,
-        warmth = 0.0f,
-        shadowLift = 0.07f
-    ),
-    KODAK(
-        id = "kodak",
-        displayName = "Kodak",
-        accentColor = Color(0xFFFFCA28),
-        contrast = 1.06f,
-        saturation = 1.11f,
-        warmth = 0.10f,
-        shadowLift = 0.06f
-    ),
-    IPHONE(
-        id = "iphone",
-        displayName = "iPhone",
-        accentColor = Color(0xFFECEFF1),
-        contrast = 1.05f,
-        saturation = 1.05f,
-        warmth = 0.02f,
-        shadowLift = 0.05f
-    ),
-    VIVO_V70(
-        id = "vivo_v70",
-        displayName = "Vivo V70",
-        accentColor = Color(0xFF26C6DA),
-        contrast = 1.09f,
-        saturation = 1.08f,
-        warmth = 0.03f,
-        shadowLift = 0.04f
-    );
+    NATURAL("naturale", "Naturale", Color(0xFF4FC3F7), 1.02f, 1.01f, 0.0f, 0.005f),
+    VIVID("vivido", "Vivido", Color(0xFFFFA726), 1.11f, 1.24f, 0.02f, 0.01f),
+    BW("bianco_nero", "Bianco e Nero", Color(0xFFE0E0E0), 1.18f, 0.0f, 0.0f, -0.01f),
+    LEICA("leica", "Leica", Color(0xFFE53935), 1.08f, 0.99f, 0.015f, 0.0f),
+    ZEISS("zeiss", "Zeiss", Color(0xFF1E88E5), 1.05f, 1.02f, -0.01f, 0.01f),
+    HASSELBLAD("hasselblad", "Hasselblad", Color(0xFFFF7043), 1.04f, 1.04f, 0.02f, 0.01f),
+    PIXEL("pixel", "Pixel", Color(0xFF66BB6A), 1.06f, 1.05f, 0.0f, 0.02f),
+    KODAK("kodak", "Kodak", Color(0xFFFFCA28), 1.03f, 1.06f, 0.035f, 0.015f);
 
-    fun toColorMatrix(strength: Float = 1.0f, brightnessOffset: Float = 0.06f): ColorMatrix {
+    fun toColorMatrix(strength: Float = 1.0f, brightnessOffset: Float = 0.0f): ColorMatrix {
         val c = 1f + (contrast - 1f) * strength
-        val s = 1f + (saturation - 1f) * strength
-        val w = warmth * strength
+        val s = if (this == BW) 0f else (1f + (saturation - 1f) * strength).coerceAtLeast(0f)
+        val w = if (this == BW) 0f else warmth * strength
         val lift = (shadowLift * strength + brightnessOffset) * 255f
 
         val invSat = 1f - s
@@ -106,8 +42,8 @@ enum class CameraProfile(
         )
 
         val translate = (1f - c) * 128f + lift
-        val warmthR = (w * 24f).coerceIn(-30f, 30f)
-        val warmthB = (-w * 24f).coerceIn(-30f, 30f)
+        val warmthR = (w * 14f).coerceIn(-18f, 18f)
+        val warmthB = (-w * 14f).coerceIn(-18f, 18f)
 
         val cwMatrix = ColorMatrix(
             floatArrayOf(
@@ -121,7 +57,7 @@ enum class CameraProfile(
         return satMatrix
     }
 
-    fun applyToBitmap(source: Bitmap, strength: Float = 1.0f, brightnessBoost: Float = 0.06f): Bitmap {
+    fun applyToBitmap(source: Bitmap, strength: Float = 1.0f, brightnessBoost: Float = 0.0f): Bitmap {
         val cm = toColorMatrix(strength, brightnessBoost)
         val filter = ColorMatrixColorFilter(android.graphics.ColorMatrix(cm.values))
         val out = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
@@ -132,10 +68,37 @@ enum class CameraProfile(
     }
 }
 
-enum class AiMode(val label: String, val shortLabel: String) {
-    LOW("AI Basso", "Basso"),
-    MEDIUM("AI Media", "Medio"),
-    AGGRESSIVE("AI Alto", "Alto")
+/**
+ * Unico selettore AI unificato (7 stati):
+ * Off · Locale (Bassa / Media / Alta) · Cloud (Bassa / Media / Alta)
+ */
+enum class UnifiedAiPreset(
+    val shortBadge: String,
+    val fullLabel: String,
+    val isEnabled: Boolean,
+    val isCloud: Boolean,
+    val level: Int // 0 = off, 1 = bassa, 2 = media, 3 = alta
+) {
+    OFF("AI Off", "AI Disattivata", false, false, 0),
+    LOCAL_LOW("AI Bassa", "Locale · Bassa", true, false, 1),
+    LOCAL_MED("AI Media", "Locale · Media", true, false, 2),
+    LOCAL_HIGH("AI Alta", "Locale · Alta", true, false, 3),
+    CLOUD_LOW("Cloud Bassa", "Cloud · Bassa", true, true, 1),
+    CLOUD_MED("Cloud Media", "Cloud · Media", true, true, 2),
+    CLOUD_HIGH("Cloud Alta", "Cloud · Alta", true, true, 3)
+}
+
+enum class TimerMode(val seconds: Int, val label: String) {
+    OFF(0, "Off"),
+    SEC_3(3, "3s"),
+    SEC_5(5, "5s"),
+    SEC_10(10, "10s")
+}
+
+enum class VideoResolution(val label: String) {
+    UHD_4K("4K UHD"),
+    FHD_1080P("1080p Full HD"),
+    HD_720P("720p HD")
 }
 
 enum class CaptureFormat(val label: String, val badge: String) {
@@ -147,7 +110,7 @@ enum class CaptureFormat(val label: String, val badge: String) {
 enum class LensType(val label: String) {
     ULTRAWIDE("Ultra-Grandangolo 8MP"),
     MAIN_50MP("Principale 50MP OIS"),
-    TELE_50MP("Teleobiettivo 50MP 3.5x OIS"),
+    TELE_50MP("Tele 50MP 3.5x OIS"),
     FRONT("Frontale 50MP")
 }
 
@@ -161,7 +124,6 @@ enum class ShootingMode(val label: String) {
     PHOTO("Foto"),
     VIDEO("Video"),
     PORTRAIT("Ritratto"),
-    TELE_50MP("Tele 50MP"),
     NIGHT("Notte")
 }
 
@@ -185,9 +147,13 @@ data class PhysicalLensInfo(
 )
 
 data class FreshCamState(
-    val profile: CameraProfile = CameraProfile.NORMAL,
+    val profile: CameraProfile = CameraProfile.NATURAL,
     val captureFormat: CaptureFormat = CaptureFormat.NORMAL,
-    val aiMode: AiMode = AiMode.MEDIUM,
+    val aiPreset: UnifiedAiPreset = UnifiedAiPreset.LOCAL_MED,
+    val timerMode: TimerMode = TimerMode.OFF,
+    val countdownRemaining: Int = 0,
+    val videoResolution: VideoResolution = VideoResolution.UHD_4K,
+    val jpegQuality: Int = 99,
     val activeLens: LensType = LensType.MAIN_50MP,
     val detectedLenses: List<PhysicalLensInfo> = emptyList(),
     val focusMode: FocusMode = FocusMode.AI_LOCK,
@@ -198,15 +164,13 @@ data class FreshCamState(
     val hdrMode: HdrMode = HdrMode.NATURAL,
     val displayZoom: Float = 1.0f,
     val lensZoomRatio: Float = 1.0f,
-    val maxLensZoomRatio: Float = 17.2f,
-    val brightnessBoost: Float = 0.08f,
-    val evCompensation: Int = 1,
+    val maxLensZoomRatio: Float = 34.3f,
+    val brightnessBoost: Float = 0.0f,
+    val evCompensation: Int = 0,
     val profileIntensity: Float = 1.0f,
     val isoValue: Int = 160,
     val shutterSpeedDenom: Int = 125,
     val stabilizationEnabled: Boolean = true,
-    val neuralSuperResEnabled: Boolean = true,
-    val cloudAiEnabled: Boolean = false,
     val cloudApiKey: String = "",
     val cloudEndpointUrl: String = "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
     val isNeuralModelReady: Boolean = false,

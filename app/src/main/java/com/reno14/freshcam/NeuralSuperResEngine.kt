@@ -30,22 +30,13 @@ data class NeuralProcessResult(
 )
 
 /**
- * Motore AI v8.0 Ottimizzato per MediaTek Dimensity (NNAPI/APU) + Cloud AI Reale:
- *
- * 1) ACCELERAZIONE MEDIATEK (NnApiDelegate):
- *    Attiva l'accelerazione hardware Android NNAPI per instradare il modello TFLite (QuickSRNetSmall / XLSR)
- *    sull'unità neurale MediaTek APU/GPU invece che sulla sola CPU, con fallback automatico su CPU 4 thread.
- *
- * 2) DOPPIA CALIBRAZIONE:
- *    - Foto normali (1x / 3.5x ottico): intervento leggero e naturale (pulizia rumore + recupero micro-contrasto
- *      e nitidezza bilanciata senza artefatti), proprio come la modalità standard potenziata.
- *    - Zoom spinto (8x – 60x): pre-pulizia forte della grana + iniezione neurale concentrata sulla zona
- *      centrale (dove cade il soggetto ingrandito) + dettaglio strutturale anti-impastamento.
- *
- * 3) CLOUD AI CON DIAGNOSTICA REALE (Hugging Face Router / Endpoint compatibile):
- *    Usa il nuovo endpoint `router.huggingface.co/hf-inference/models/...`, gestisce sia risposte immagine
- *    binarie sia risposte JSON base64, e restituisce un messaggio chiaro (es. "Cloud OK", "Cloud: Token mancante",
- *    "Cloud: HTTP 401/503") così sai sempre se e come sta lavorando.
+ * Motore Fotografico & AI v12.0 (Generale, Pulito, Potente):
+ * - Nessuna modalità rigida che rovina altri scatti: il motore si adatta automaticamente
+ *   alla lente (IMX882 1x vs Tele JN5 3.5x-7x), al fattore di zoom (fino a 120x) e al movimento.
+ * - Anti-Ghosting automatico nel Burst: se rileva movimento nella scena scarta i frame mossi
+ *   invece di creare doppie sagome.
+ * - Teleobiettivo JN5 (3.5x-7x): deconvoluzione ottica dedicata anche con AI OFF.
+ * - Zoom spinto (20x-120x): ritaglio digitale ad alta precisione + Burst anti-ghosting + NNAPI + Cloud AI.
  */
 class NeuralSuperResEngine(private val context: Context) {
 
@@ -58,9 +49,7 @@ class NeuralSuperResEngine(private val context: Context) {
         private set
 
     @Synchronized
-    fun isModelAvailable(): Boolean {
-        return getInterpreter() != null
-    }
+    fun isModelAvailable(): Boolean = getInterpreter() != null
 
     @Synchronized
     private fun getInterpreter(): Interpreter? {
@@ -75,7 +64,6 @@ class NeuralSuperResEngine(private val context: Context) {
                 val fileChannel = inputStream.channel
                 val mappedBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.declaredLength)
 
-                // Prova prima con MediaTek NNAPI (APU/GPU), poi fallback su CPU
                 var tflite: Interpreter? = null
                 try {
                     val delegate = NnApiDelegate()
@@ -85,7 +73,7 @@ class NeuralSuperResEngine(private val context: Context) {
                     }
                     tflite = Interpreter(mappedBuffer, nnOpts)
                     nnApiDelegate = delegate
-                    acceleratorName = "MediaTek NNAPI"
+                    acceleratorName = "MediaTek APU 780 (NNAPI)"
                 } catch (_: Throwable) {
                     nnApiDelegate?.close()
                     nnApiDelegate = null
@@ -93,7 +81,7 @@ class NeuralSuperResEngine(private val context: Context) {
                         setNumThreads(4)
                     }
                     tflite = Interpreter(mappedBuffer, cpuOpts)
-                    acceleratorName = "CPU 4T"
+                    acceleratorName = "CPU Dimensity 4T"
                 }
 
                 val inShape = tflite!!.getInputTensor(0).shape()
@@ -104,7 +92,6 @@ class NeuralSuperResEngine(private val context: Context) {
                 }
                 interpreter = tflite
                 loadedAssetName = assetName
-                Log.i("NeuralSR", "Modello $assetName caricato su $acceleratorName")
                 return tflite
             } catch (e: Throwable) {
                 Log.w("NeuralSR", "Asset $assetName non caricabile: ${e.message}")
@@ -118,46 +105,62 @@ class NeuralSuperResEngine(private val context: Context) {
         profile: CameraProfile,
         profileIntensity: Float,
         brightnessBoost: Float,
-        aiMode: AiMode,
-        isTeleLens: Boolean,
+        aiPreset: UnifiedAiPreset,
+        activeLens: LensType,
         displayZoom: Float,
-        lensZoomRatio: Float,
-        superResEnabled: Boolean,
-        cloudAiEnabled: Boolean,
+        digitalExtraZoom: Float,
         cloudEndpointUrl: String,
         cloudApiKey: String,
         postSavePolish: Boolean
     ): NeuralProcessResult {
-        val primaryFrame = frames.first()
+        // Se lo zoom richiesto supera il massimo zoom hardware della lente (es. 60x-120x),
+        // esegue un ritaglio digitale pulito prima dell'elaborazione AI
+        val croppedFrames = if (digitalExtraZoom > 1.03f) {
+            frames.map { applyDigitalCrop(it, digitalExtraZoom) }
+        } else {
+            frames
+        }
+
+        val primaryFrame = croppedFrames.first()
         var working = profile.applyToBitmap(
             source = primaryFrame,
             strength = profileIntensity,
             brightnessBoost = brightnessBoost
         )
 
-        if (!superResEnabled) {
+        val isTeleLens = activeLens == LensType.TELE_50MP
+
+        if (!aiPreset.isEnabled) {
+            if (isTeleLens) {
+                val teleOpt = applyTeleOpticalDeconvolution(working, strength = 0.34f)
+                if (teleOpt !== working) working.recycle()
+                working = teleOpt
+            }
             if (postSavePolish) {
-                val toned = applyToneBalance(working, strength = 0.45f)
+                val toned = applyTrueColorToneCurve(working, strength = 0.30f)
                 if (toned !== working) working.recycle()
                 working = toned
             }
+            if (croppedFrames !== frames) croppedFrames.forEach { if (!it.isRecycled) it.recycle() }
             return NeuralProcessResult(
                 bitmap = working,
-                modeApplied = "AI OFF"
+                modeApplied = if (isTeleLens) "Tele Ottico (AI Off)" else "Naturale (AI Off)"
             )
         }
 
-        val isZoomSpinto = displayZoom >= 8.0f || lensZoomRatio >= 2.2f
-        val isZoomEstremo = displayZoom >= 25.0f || lensZoomRatio >= 7.0f
+        val isOpticalRange = displayZoom <= 7.05f
+        val isTeleSpinto = displayZoom >= 8.0f
+        val isTeleEstremo = displayZoom >= 20.0f
+        val level = aiPreset.level
 
-        // 1. Fusione Burst allineata (su zoom spinto o AI Medio/Alto) per pulire rumore reale
+        // 1. Burst Multi-Frame con protezione automatica Anti-Ghosting (solo sopra i 7x ottici)
         var burstUsed = false
-        if (frames.size > 1) {
+        if (isTeleSpinto && croppedFrames.size > 1) {
             try {
-                val gradedExtras = frames.drop(1).map {
+                val gradedExtras = croppedFrames.drop(1).map {
                     profile.applyToBitmap(it, strength = profileIntensity, brightnessBoost = brightnessBoost)
                 }
-                val merged = alignAndMergeBurst(working, gradedExtras)
+                val merged = alignAndMergeBurstAntiGhost(working, gradedExtras)
                 gradedExtras.forEach { if (!it.isRecycled) it.recycle() }
                 if (merged !== working) {
                     working.recycle()
@@ -168,13 +171,14 @@ class NeuralSuperResEngine(private val context: Context) {
                 Log.e("NeuralSR", "Burst fallback", t)
             }
         }
+        if (croppedFrames !== frames) croppedFrames.forEach { if (!it.isRecycled) it.recycle() }
 
-        // 2. Denoise bilaterale mirato (leggero a 1x, più deciso su zoom spinto)
+        // 2. Pulizia rumore calibrata (solo chroma sotto 7x, chroma + luma leggera sopra 20x)
         val denoised = try {
             filterChromaAndNoise(
                 bitmap = working,
-                chromaPasses = if (isZoomSpinto) 2 else 1,
-                lumaPasses = if (isZoomEstremo) 1 else 0
+                chromaPasses = if (isTeleSpinto || isTeleLens) 2 else 1,
+                lumaPasses = if (isTeleEstremo) 1 else 0
             )
         } catch (_: Throwable) {
             working
@@ -182,20 +186,17 @@ class NeuralSuperResEngine(private val context: Context) {
         if (denoised !== working && !working.isRecycled) working.recycle()
         working = denoised
 
-        // 3. Rete Neurale TFLite su MediaTek NNAPI:
-        //    - A 1x: intervento leggero ma ben percepibile su tutta la scena (come l'ottimizzazione AI stock)
-        //    - Su zoom spinto (8x-60x): inferenza densa sulla regione del soggetto + ricostruzione bordi
+        // 3. Motore Neurale TFLite (MediaTek APU 780 NNAPI)
         val tflite = getInterpreter()
         var neuralUsed = false
         if (tflite != null) {
             try {
-                val neuralOut = runTargetedNeuralEnhancement(
+                val neuralOut = runNeuralDetailEngine(
                     tflite = tflite,
                     source = working,
-                    aiMode = aiMode,
-                    isTeleLens = isTeleLens,
-                    isZoomSpinto = isZoomSpinto,
-                    isZoomEstremo = isZoomEstremo
+                    level = level,
+                    isOpticalRange = isOpticalRange,
+                    isTeleEstremo = isTeleEstremo
                 )
                 if (neuralOut !== working) {
                     working.recycle()
@@ -207,56 +208,59 @@ class NeuralSuperResEngine(private val context: Context) {
             }
         }
 
-        // 4. Cloud AI con feedback esplicito
+        // 4. Cloud AI (quando selezionato Cloud Bassa / Media / Alta dal tasto unico AI)
         var cloudStatus = ""
-        if (cloudAiEnabled) {
-            if (cloudApiKey.isBlank()) {
-                cloudStatus = "Cloud: inserisci Token HF"
-            } else {
-                val (cloudBmp, statusMsg) = tryCloudSuperResolution(
-                    source = working,
-                    endpointUrl = cloudEndpointUrl,
-                    apiKey = cloudApiKey,
-                    isZoomEstremo = isZoomEstremo
-                )
-                cloudStatus = statusMsg
-                if (cloudBmp != null) {
-                    if (cloudBmp !== working) working.recycle()
-                    working = cloudBmp
-                }
+        if (aiPreset.isCloud) {
+            val cloudAlpha = when (level) {
+                1 -> 150
+                2 -> 200
+                else -> 240
+            }
+            val (cloudBmp, statusMsg) = tryCloudSuperResolution(
+                source = working,
+                endpointUrl = cloudEndpointUrl,
+                apiKey = cloudApiKey,
+                isTeleEstremo = isTeleEstremo,
+                blendAlpha = cloudAlpha
+            )
+            cloudStatus = statusMsg
+            if (cloudBmp != null) {
+                if (cloudBmp !== working) working.recycle()
+                working = cloudBmp
             }
         }
 
-        // 5. Micro-contrasto locale e nitidezza adattiva (leggera a 1x, decisa sullo zoom spinto)
-        val clarityAmount = when {
-            isZoomEstremo -> when (aiMode) {
-                AiMode.LOW -> 0.18f
-                AiMode.MEDIUM -> 0.28f
-                AiMode.AGGRESSIVE -> 0.36f
+        // 5. Deconvoluzione ottica dedicata per Tele JN5 o Micro-dettaglio per Principale IMX882
+        val teleBonus = if (isTeleLens) 0.14f else 0.0f
+        val clarityGain = when {
+            isTeleEstremo -> when (level) {
+                1 -> 0.24f
+                2 -> 0.34f
+                else -> 0.44f
             }
-            isZoomSpinto -> when (aiMode) {
-                AiMode.LOW -> 0.14f
-                AiMode.MEDIUM -> 0.22f
-                AiMode.AGGRESSIVE -> 0.30f
+            isTeleSpinto -> when (level) {
+                1 -> 0.20f
+                2 -> 0.28f
+                else -> 0.36f
             }
-            else -> when (aiMode) {
-                // Foto normali 1x: migliora pulizia e tridimensionalità in modo discreto
-                AiMode.LOW -> 0.08f
-                AiMode.MEDIUM -> 0.14f
-                AiMode.AGGRESSIVE -> 0.20f
+            else -> when (level) {
+                1 -> 0.14f + teleBonus
+                2 -> 0.22f + teleBonus
+                else -> 0.30f + teleBonus
             }
         }
-        val clarified = try {
-            localClarityBoost(working, clarityAmount)
+        val detailed = try {
+            if (isTeleLens) applyTeleOpticalDeconvolution(working, strength = clarityGain)
+            else applyMultiScaleDetail(working, gain = clarityGain)
         } catch (_: Throwable) {
             working
         }
-        if (clarified !== working && !working.isRecycled) working.recycle()
-        working = clarified
+        if (detailed !== working && !working.isRecycled) working.recycle()
+        working = detailed
 
         if (postSavePolish) {
             val toned = try {
-                applyToneBalance(working, strength = if (isZoomSpinto) 0.65f else 0.50f)
+                applyTrueColorToneCurve(working, strength = if (isTeleSpinto) 0.45f else 0.30f)
             } catch (_: Throwable) {
                 working
             }
@@ -265,11 +269,10 @@ class NeuralSuperResEngine(private val context: Context) {
         }
 
         val parts = mutableListOf<String>()
-        val scope = if (isZoomSpinto) "Zoom" else "1x"
-        if (burstUsed) parts.add("Burst ${frames.size}x")
-        if (neuralUsed) parts.add("NN ${aiMode.shortLabel} ($scope)")
+        if (burstUsed) parts.add("Burst")
+        if (neuralUsed) parts.add(aiPreset.shortBadge)
         if (cloudStatus.isNotEmpty()) parts.add(cloudStatus)
-        if (parts.isEmpty()) parts.add("AI ${aiMode.shortLabel} ($scope)")
+        if (parts.isEmpty()) parts.add(aiPreset.shortBadge)
 
         return NeuralProcessResult(
             bitmap = working,
@@ -277,7 +280,62 @@ class NeuralSuperResEngine(private val context: Context) {
         )
     }
 
-    private fun alignAndMergeBurst(base: Bitmap, extras: List<Bitmap>): Bitmap {
+    private fun applyDigitalCrop(bmp: Bitmap, factor: Float): Bitmap {
+        val f = factor.coerceIn(1.0f, 4.0f)
+        val newW = (bmp.width / f).toInt().coerceAtLeast(256)
+        val newH = (bmp.height / f).toInt().coerceAtLeast(256)
+        val sx = (bmp.width - newW) / 2
+        val sy = (bmp.height - newH) / 2
+        val crop = Bitmap.createBitmap(bmp, sx, sy, newW, newH)
+        val upscaled = Bitmap.createScaledBitmap(crop, bmp.width, bmp.height, true)
+        crop.recycle()
+        return upscaled
+    }
+
+    private fun applyTeleOpticalDeconvolution(bitmap: Bitmap, strength: Float): Bitmap {
+        val w = bitmap.width
+        val h = bitmap.height
+        val src = IntArray(w * h)
+        val dst = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
+
+        val fineGain = (strength * 1.15f).coerceIn(0.15f, 0.70f)
+        for (y in 1 until h - 1) {
+            val row = y * w
+            for (x in 1 until w - 1) {
+                val idx = row + x
+                val c = src[idx]
+                val cr = (c ushr 16) and 0xFF
+                val cg = (c ushr 8) and 0xFF
+                val cb = c and 0xFF
+
+                val n = src[idx - w]
+                val s = src[idx + w]
+                val e = src[idx + 1]
+                val west = src[idx - 1]
+
+                val avgR = (((n ushr 16) and 0xFF) + ((s ushr 16) and 0xFF) + ((e ushr 16) and 0xFF) + ((west ushr 16) and 0xFF)) shr 2
+                val avgG = (((n ushr 8) and 0xFF) + ((s ushr 8) and 0xFF) + ((e ushr 8) and 0xFF) + ((west ushr 8) and 0xFF)) shr 2
+                val avgB = ((n and 0xFF) + (s and 0xFF) + (e and 0xFF) + (west and 0xFF)) shr 2
+
+                val dR = (cr - avgR).coerceIn(-22, 22)
+                val dG = (cg - avgG).coerceIn(-22, 22)
+                val dB = (cb - avgB).coerceIn(-22, 22)
+
+                val nr = if (abs(dR) > 3) (cr + dR * fineGain).toInt().coerceIn(0, 255) else cr
+                val ng = if (abs(dG) > 3) (cg + dG * fineGain).toInt().coerceIn(0, 255) else cg
+                val nb = if (abs(dB) > 3) (cb + dB * fineGain).toInt().coerceIn(0, 255) else cb
+
+                dst[idx] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+            }
+        }
+        copyBorders(src, dst, w, h)
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(dst, 0, w, 0, 0, w, h)
+        return out
+    }
+
+    private fun alignAndMergeBurstAntiGhost(base: Bitmap, extras: List<Bitmap>): Bitmap {
         val w = base.width
         val h = base.height
         val total = w * h
@@ -322,6 +380,7 @@ class NeuralSuperResEngine(private val context: Context) {
                 }
             }
 
+            // Soglia severa anti-ghosting (16): se un pixel si è spostato tra i frame viene ignorato
             for (y in 8 until h - 8) {
                 val rowB = y * w
                 val rowE = (y + bestDy) * w
@@ -339,7 +398,7 @@ class NeuralSuperResEngine(private val context: Context) {
                     val eg = (ep ushr 8) and 0xFF
                     val eb = ep and 0xFF
 
-                    if ((abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3 < 26) {
+                    if ((abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3 < 16) {
                         accR[idxB] += er
                         accG[idxB] += eg
                         accB[idxB] += eb
@@ -362,20 +421,12 @@ class NeuralSuperResEngine(private val context: Context) {
         return out
     }
 
-    /**
-     * Esegue il modello TFLite leggero su NNAPI/MediaTek:
-     * - A 1x usa una griglia 3x3 sull'intera foto con peso residuale leggero (0.28 - 0.55)
-     * - Su zoom spinto (8x-60x) concentra una griglia 4x4 sull'area centrale (75% del frame)
-     *   dove i tasselli hanno risoluzione quasi 1:1 con l'input della rete neurale, evitando
-     *   l'effetto "impastato" e ricostruendo i contorni reali con peso 0.75 - 1.35.
-     */
-    private fun runTargetedNeuralEnhancement(
+    private fun runNeuralDetailEngine(
         tflite: Interpreter,
         source: Bitmap,
-        aiMode: AiMode,
-        isTeleLens: Boolean,
-        isZoomSpinto: Boolean,
-        isZoomEstremo: Boolean
+        level: Int,
+        isOpticalRange: Boolean,
+        isTeleEstremo: Boolean
     ): Bitmap {
         val inTensor = tflite.getInputTensor(0)
         val outTensor = tflite.getOutputTensor(0)
@@ -396,11 +447,9 @@ class NeuralSuperResEngine(private val context: Context) {
         val outH = (if (rawOutH > 0) rawOutH else inH * 4).coerceAtLeast(inH)
         val outW = (if (rawOutW > 0) rawOutW else inW * 4).coerceAtLeast(inW)
 
-        // Su zoom spinto lavoriamo sul 75% centrale (dove sta il soggetto ingrandito),
-        // a 1x lavoriamo sul 92% dell'intera scena
-        val coverage = if (isZoomSpinto) 0.75f else 0.92f
-        val cols = if (isZoomSpinto) 4 else 3
-        val rows = if (isZoomSpinto) 4 else 3
+        val coverage = if (!isOpticalRange) 0.72f else 0.94f
+        val cols = if (isTeleEstremo) 6 else if (!isOpticalRange) 5 else 4
+        val rows = if (isTeleEstremo) 6 else if (!isOpticalRange) 5 else 4
 
         val workBase = scaleToMaxSide(source, 1600)
         val regW = (workBase.width * coverage).toInt().coerceAtLeast(cols * 32)
@@ -530,29 +579,24 @@ class NeuralSuperResEngine(private val context: Context) {
         baselineMap.recycle()
 
         val residualStrength = when {
-            isZoomEstremo -> when (aiMode) {
-                AiMode.LOW -> 0.70f
-                AiMode.MEDIUM -> 1.05f
-                AiMode.AGGRESSIVE -> 1.35f
+            isTeleEstremo -> when (level) {
+                1 -> 0.85f
+                2 -> 1.15f
+                else -> 1.40f
             }
-            isZoomSpinto -> when (aiMode) {
-                AiMode.LOW -> 0.55f
-                AiMode.MEDIUM -> 0.85f
-                AiMode.AGGRESSIVE -> 1.15f
+            !isOpticalRange -> when (level) {
+                1 -> 0.60f
+                2 -> 0.85f
+                else -> 1.10f
             }
-            isTeleLens -> when (aiMode) {
-                AiMode.LOW -> 0.35f
-                AiMode.MEDIUM -> 0.55f
-                AiMode.AGGRESSIVE -> 0.75f
-            }
-            else -> when (aiMode) {
-                // Foto normali 1x: miglioramento leggero e naturale
-                AiMode.LOW -> 0.28f
-                AiMode.MEDIUM -> 0.42f
-                AiMode.AGGRESSIVE -> 0.58f
+            else -> when (level) {
+                1 -> 0.30f
+                2 -> 0.45f
+                else -> 0.60f
             }
         }
 
+        val detailCap = if (isOpticalRange) 18f else 26f
         val w = source.width
         val h = source.height
         val origPx = IntArray(w * h)
@@ -578,8 +622,9 @@ class NeuralSuperResEngine(private val context: Context) {
             val yNeur = 0.299f * ((n ushr 16) and 0xFF) + 0.587f * ((n ushr 8) and 0xFF) + 0.114f * (n and 0xFF)
             val yBase = 0.299f * ((b ushr 16) and 0xFF) + 0.587f * ((b ushr 8) and 0xFF) + 0.114f * (b and 0xFF)
 
-            val neuralDetail = (yNeur - yBase).coerceIn(-30f, 30f)
-            val yEnhanced = (yOrig + neuralDetail * residualStrength).coerceIn(0f, 255f)
+            val rawDetail = (yNeur - yBase).coerceIn(-detailCap, detailCap)
+            val cleanDetail = if (abs(rawDetail) < 2.2f) 0f else rawDetail
+            val yEnhanced = (yOrig + cleanDetail * residualStrength).coerceIn(0f, 255f)
             val delta = yEnhanced - yOrig
 
             val outR = (or + delta).toInt().coerceIn(0, 255)
@@ -594,41 +639,40 @@ class NeuralSuperResEngine(private val context: Context) {
         return out
     }
 
-    /**
-     * Invia l'immagine (o il ritaglio centrale su zoom spinto) al modello Cloud Swin2SR / Diffusion
-     * tramite Hugging Face Router API e gestisce sia risposte immagine binarie sia JSON.
-     */
     private fun tryCloudSuperResolution(
         source: Bitmap,
         endpointUrl: String,
         apiKey: String,
-        isZoomEstremo: Boolean
+        isTeleEstremo: Boolean,
+        blendAlpha: Int
     ): Pair<Bitmap?, String> {
         return try {
-            val cropRatio = if (isZoomEstremo) 0.55f else 0.70f
+            val cropRatio = if (isTeleEstremo) 0.55f else 0.72f
             val cw = (source.width * cropRatio).toInt().coerceIn(256, source.width)
             val ch = (source.height * cropRatio).toInt().coerceIn(256, source.height)
             val sx = (source.width - cw) / 2
             val sy = (source.height - ch) / 2
 
             val centerCrop = Bitmap.createBitmap(source, sx, sy, cw, ch)
-            val uploadBmp = scaleToMaxSide(centerCrop, 640)
+            val uploadBmp = scaleToMaxSide(centerCrop, 768)
             if (uploadBmp !== centerCrop) centerCrop.recycle()
 
             val baos = ByteArrayOutputStream()
-            uploadBmp.compress(Bitmap.CompressFormat.JPEG, 92, baos)
+            uploadBmp.compress(Bitmap.CompressFormat.JPEG, 94, baos)
             uploadBmp.recycle()
             val payload = baos.toByteArray()
 
             val conn = (URL(endpointUrl).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
-                connectTimeout = 7000
-                readTimeout = 20000
+                connectTimeout = 8000
+                readTimeout = 25000
                 doOutput = true
                 setRequestProperty("Content-Type", "image/jpeg")
                 setRequestProperty("Accept", "image/png, image/jpeg, application/json")
-                val token = if (apiKey.trim().startsWith("Bearer ")) apiKey.trim() else "Bearer ${apiKey.trim()}"
-                setRequestProperty("Authorization", token)
+                if (apiKey.isNotBlank()) {
+                    val token = if (apiKey.trim().startsWith("Bearer ")) apiKey.trim() else "Bearer ${apiKey.trim()}"
+                    setRequestProperty("Authorization", token)
+                }
             }
 
             conn.outputStream.use { it.write(payload) }
@@ -654,7 +698,7 @@ class NeuralSuperResEngine(private val context: Context) {
                     val result = source.copy(Bitmap.Config.ARGB_8888, true)
                     val canvas = Canvas(result)
                     val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-                        alpha = 210
+                        alpha = blendAlpha.coerceIn(100, 255)
                     }
                     canvas.drawBitmap(cloudPatch, null, Rect(sx, sy, sx + cw, sy + ch), paint)
                     cloudPatch.recycle()
@@ -663,16 +707,16 @@ class NeuralSuperResEngine(private val context: Context) {
                 return null to "Cloud: risposta vuota"
             } else {
                 val errHint = when (code) {
-                    401, 403 -> "Token HF non valido"
-                    404 -> "Modello Cloud non trovato"
-                    503 -> "Modello in avvio, riprova"
+                    401, 403 -> "Token HF richiesto"
+                    404 -> "Endpoint non trovato"
+                    503 -> "Modello in avvio"
                     else -> "HTTP $code"
                 }
                 return null to "Cloud: $errHint"
             }
         } catch (e: Throwable) {
             Log.w("NeuralSR", "Errore Cloud AI: ${e.message}")
-            null to "Cloud: offline/timeout"
+            null to "Cloud: timeout/rete"
         }
     }
 
@@ -778,11 +822,11 @@ class NeuralSuperResEngine(private val context: Context) {
         return out
     }
 
-    private fun localClarityBoost(bitmap: Bitmap, amount: Float): Bitmap {
-        if (amount <= 0.02f) return bitmap
+    private fun applyMultiScaleDetail(bitmap: Bitmap, gain: Float): Bitmap {
+        if (gain <= 0.02f) return bitmap
         val w = bitmap.width
         val h = bitmap.height
-        val small = Bitmap.createScaledBitmap(bitmap, max(1, w / 4), max(1, h / 4), true)
+        val small = Bitmap.createScaledBitmap(bitmap, max(1, w / 3), max(1, h / 3), true)
         val blur = Bitmap.createScaledBitmap(small, w, h, true)
         small.recycle()
 
@@ -798,12 +842,22 @@ class NeuralSuperResEngine(private val context: Context) {
             val sr = (s ushr 16) and 0xFF
             val sg = (s ushr 8) and 0xFF
             val sb = s and 0xFF
-            val dR = sr - ((b ushr 16) and 0xFF)
-            val dG = sg - ((b ushr 8) and 0xFF)
-            val dB = sb - (b and 0xFF)
-            val nr = (sr + dR * amount).toInt().coerceIn(0, 255)
-            val ng = (sg + dG * amount).toInt().coerceIn(0, 255)
-            val nb = (sb + dB * amount).toInt().coerceIn(0, 255)
+
+            val lum = (77 * sr + 150 * sg + 29 * sb) shr 8
+            val lumProtection = when {
+                lum > 224 -> ((255 - lum) / 31f).coerceIn(0.20f, 1.0f)
+                lum < 18 -> (lum / 18f).coerceIn(0.30f, 1.0f)
+                else -> 1.0f
+            }
+            val effGain = gain * lumProtection
+
+            val dR = (sr - ((b ushr 16) and 0xFF)).coerceIn(-24, 24)
+            val dG = (sg - ((b ushr 8) and 0xFF)).coerceIn(-24, 24)
+            val dB = (sb - (b and 0xFF)).coerceIn(-24, 24)
+
+            val nr = (sr + dR * effGain).toInt().coerceIn(0, 255)
+            val ng = (sg + dG * effGain).toInt().coerceIn(0, 255)
+            val nb = (sb + dB * effGain).toInt().coerceIn(0, 255)
             src[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
         }
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -811,21 +865,23 @@ class NeuralSuperResEngine(private val context: Context) {
         return out
     }
 
-    private fun applyToneBalance(bitmap: Bitmap, strength: Float): Bitmap {
+    private fun applyTrueColorToneCurve(bitmap: Bitmap, strength: Float): Bitmap {
         val w = bitmap.width
         val h = bitmap.height
         val pixels = IntArray(w * h)
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        val curve = 0.045 * strength
-        val lift = 8.0 * strength
+        val curve = 0.025 * strength
+        val lift = 2.0 * strength
 
         val lut = IntArray(256)
         for (v in 0..255) {
             val norm = v / 255.0
             val sCurve = norm - curve * sin(2.0 * Math.PI * norm)
-            val shadowLift = (lift / 255.0) * (1.0 - norm) * (1.0 - norm)
-            lut[v] = ((sCurve + shadowLift) * 255.0).toInt().coerceIn(0, 255)
+            val shadowLift = (lift / 255.0) * (1.0 - norm) * (1.0 - norm) * (1.0 - norm)
+            val mapped = sCurve + shadowLift
+            val safe = if (mapped > 0.88) 0.88 + (mapped - 0.88) * 0.88 else mapped
+            lut[v] = (safe * 255.0).toInt().coerceIn(0, 255)
         }
         for (i in pixels.indices) {
             val p = pixels[i]

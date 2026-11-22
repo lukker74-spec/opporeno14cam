@@ -12,8 +12,8 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 14
-        versionName = "8.0.0-mediatek-hybrid-ai"
+        versionCode = 18
+        versionName = "12.0.0-prodial-unified-ai"
     }
 
     buildTypes {

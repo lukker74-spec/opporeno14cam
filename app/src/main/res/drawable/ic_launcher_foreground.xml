@@ -18,18 +18,10 @@
         android:strokeColor="#80FFFFFF"
         android:fillColor="#FF0A0E14" />
 
-    <path
-        android:pathData="M54,34 L66,46 L54,46 Z"
-        android:fillColor="#4D26C6DA" />
-    <path
-        android:pathData="M74,54 L62,66 L62,54 Z"
-        android:fillColor="#4D4FC3F7" />
-    <path
-        android:pathData="M54,74 L42,62 L54,62 Z"
-        android:fillColor="#4D26C6DA" />
-    <path
-        android:pathData="M34,54 L46,42 L46,54 Z"
-        android:fillColor="#4D4FC3F7" />
+    <path android:pathData="M54,34 L66,46 L54,46 Z" android:fillColor="#4D26C6DA" />
+    <path android:pathData="M74,54 L62,66 L62,54 Z" android:fillColor="#4D4FC3F7" />
+    <path android:pathData="M54,74 L42,62 L54,62 Z" android:fillColor="#4D26C6DA" />
+    <path android:pathData="M34,54 L46,42 L46,54 Z" android:fillColor="#4D4FC3F7" />
 
     <path android:pathData="M54,41 A13,13 0 1,1 53.99,41 Z">
         <aapt:attr name="android:fillColor">
@@ -46,14 +38,7 @@
         </aapt:attr>
     </path>
 
-    <path
-        android:pathData="M48,46 A3.2,3.2 0 1,1 47.99,46 Z"
-        android:fillColor="#CCFFFFFF" />
-    <path
-        android:pathData="M59,59 A1.5,1.5 0 1,1 58.99,59 Z"
-        android:fillColor="#80FFCA28" />
-
-    <path
-        android:pathData="M75,33 A2.4,2.4 0 1,1 74.99,33 Z"
-        android:fillColor="#FFFF5252" />
+    <path android:pathData="M48,46 A3.2,3.2 0 1,1 47.99,46 Z" android:fillColor="#CCFFFFFF" />
+    <path android:pathData="M59,59 A1.5,1.5 0 1,1 58.99,59 Z" android:fillColor="#80FFCA28" />
+    <path android:pathData="M75,33 A2.4,2.4 0 1,1 74.99,33 Z" android:fillColor="#FFFF5252" />
 </vector>

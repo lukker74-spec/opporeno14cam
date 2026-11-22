@@ -33,6 +33,7 @@ import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.MediaStoreOutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
@@ -66,6 +67,9 @@ class FreshCameraEngine(
     private val neuralEngine = NeuralSuperResEngine(context)
 
     var minFocusDistanceDiopters: Float = 0f
+        private set
+
+    var currentMaxHwZoomRatio: Float = 10.0f
         private set
 
     private var discoveredLenses: List<PhysicalLensInfo> = emptyList()
@@ -148,23 +152,25 @@ class FreshCameraEngine(
                 val resSelector = ResolutionSelector.Builder()
                     .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
                     .build()
+
                 val captureBuilder = ImageCapture.Builder()
                     .setResolutionSelector(resSelector)
-                    .setJpegQuality(99)
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .setJpegQuality(state.jpegQuality.coerceIn(85, 100))
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
 
                 val pExt = Camera2Interop.Extender(previewBuilder)
                 val cExt = Camera2Interop.Extender(captureBuilder)
 
+                val isTele = state.activeLens == LensType.TELE_50MP
                 val nrMode = if (state.captureFormat == CaptureFormat.RAW) {
                     CaptureRequest.NOISE_REDUCTION_MODE_FAST
                 } else {
                     CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
                 }
-                val edgeMode = if (state.captureFormat == CaptureFormat.RAW || state.aiMode == AiMode.LOW) {
-                    CaptureRequest.EDGE_MODE_FAST
-                } else {
+                val edgeMode = if (isTele) {
                     CaptureRequest.EDGE_MODE_HIGH_QUALITY
+                } else {
+                    CaptureRequest.EDGE_MODE_FAST
                 }
 
                 pExt.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, nrMode)
@@ -173,7 +179,9 @@ class FreshCameraEngine(
                 cExt.setCaptureRequestOption(CaptureRequest.EDGE_MODE, edgeMode)
                 cExt.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
                 cExt.setCaptureRequestOption(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_HIGH_QUALITY)
+                cExt.setCaptureRequestOption(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_HIGH_QUALITY)
 
+                // Stabilizzazione Ottica (OIS) + Elettronica (EIS) spinte al massimo
                 val oisMode = if (state.stabilizationEnabled) {
                     CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
                 } else {
@@ -246,7 +254,16 @@ class FreshCameraEngine(
                 val preview = previewBuilder.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
                 imageCapture = captureBuilder.build()
 
-                val recorder = Recorder.Builder().setQualitySelector(QualitySelector.from(Quality.HIGHEST)).build()
+                val targetQuality = when (state.videoResolution) {
+                    VideoResolution.UHD_4K -> Quality.UHD
+                    VideoResolution.FHD_1080P -> Quality.FHD
+                    VideoResolution.HD_720P -> Quality.HD
+                }
+                val qualitySelector = QualitySelector.from(
+                    targetQuality,
+                    FallbackStrategy.lowerQualityOrHigherThan(targetQuality)
+                )
+                val recorder = Recorder.Builder().setQualitySelector(qualitySelector).build()
                 val vBuilder = VideoCapture.Builder(recorder)
                 val vExt = Camera2Interop.Extender(vBuilder)
                 vExt.setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, oisMode)
@@ -266,6 +283,7 @@ class FreshCameraEngine(
                 minFocusDistanceDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
 
                 bound.cameraInfo.zoomState.value?.let { zs ->
+                    currentMaxHwZoomRatio = zs.maxZoomRatio
                     onZoomBounds(zs.minZoomRatio, zs.maxZoomRatio)
                     val targetRatio = if (state.activeLens == LensType.MAIN_50MP && state.displayZoom <= 1.05f) {
                         1.0f.coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
@@ -283,6 +301,7 @@ class FreshCameraEngine(
 
     fun setZoom(ratio: Float) {
         val zs = camera?.cameraInfo?.zoomState?.value ?: return
+        currentMaxHwZoomRatio = zs.maxZoomRatio
         camera?.cameraControl?.setZoomRatio(ratio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio))
     }
 
@@ -316,11 +335,6 @@ class FreshCameraEngine(
         return best
     }
 
-    /**
-     * Scatto adattivo per MediaTek:
-     * - Su foto normali 1x con AI: ON scatta 1 fotogramma + NNAPI veloce (salvataggio quasi istantaneo).
-     * - Su zoom spinto (8x-60x) o AI Alto scatta una raffica di 3 fotogrammi allineati + NNAPI + Cloud opzionale.
-     */
     fun shootInstant(
         snapshot: FreshCamState,
         onStatus: (String) -> Unit,
@@ -332,13 +346,21 @@ class FreshCameraEngine(
         }
 
         val capturedLocation = if (snapshot.locationTagEnabled) getLastKnownLocation() else null
-        val isZoomSpinto = snapshot.displayZoom >= 8.0f || snapshot.lensZoomRatio >= 2.2f
-        val burstCount = if (snapshot.neuralSuperResEnabled && snapshot.captureFormat != CaptureFormat.RAW && (isZoomSpinto || snapshot.aiMode == AiMode.AGGRESSIVE)) 3 else 1
-        val maxSide = if (snapshot.neuralSuperResEnabled) 3200 else 4200
+        val isTeleSpinto = snapshot.displayZoom >= 8.0f
+        val needBurst = snapshot.aiPreset.isEnabled && snapshot.captureFormat != CaptureFormat.RAW && isTeleSpinto
+        val burstCount = if (needBurst) 3 else 1
+        val maxSide = if (snapshot.aiPreset.isEnabled) 3600 else 4400
         val collectedFrames = mutableListOf<Bitmap>()
 
-        if (snapshot.neuralSuperResEnabled) {
-            onStatus(if (burstCount > 1) "Elaborazione Burst ${burstCount}x + AI..." else "Elaborazione AI in corso...")
+        // Calcola l'eventuale extra zoom digitale se l'utente ha spinto fino a 120x oltre il limite hardware Camera2
+        val digitalExtraZoom = if (snapshot.activeLens == LensType.TELE_50MP && snapshot.lensZoomRatio > currentMaxHwZoomRatio) {
+            (snapshot.lensZoomRatio / currentMaxHwZoomRatio).coerceIn(1.0f, 4.0f)
+        } else {
+            1.0f
+        }
+
+        if (snapshot.aiPreset.isEnabled) {
+            onStatus(if (burstCount > 1) "Elaborazione ${snapshot.aiPreset.shortBadge} + Burst..." else "Elaborazione ${snapshot.aiPreset.shortBadge}...")
         }
 
         fun captureNextFrame(remaining: Int) {
@@ -363,13 +385,13 @@ class FreshCameraEngine(
                         if (remaining > 1 && collectedFrames.isNotEmpty()) {
                             captureNextFrame(remaining - 1)
                         } else {
-                            processAndSaveFrames(collectedFrames, snapshot, capturedLocation, onResult)
+                            processAndSaveFrames(collectedFrames, snapshot, digitalExtraZoom, capturedLocation, onResult)
                         }
                     }
 
                     override fun onError(exception: ImageCaptureException) {
                         if (collectedFrames.isNotEmpty()) {
-                            processAndSaveFrames(collectedFrames, snapshot, capturedLocation, onResult)
+                            processAndSaveFrames(collectedFrames, snapshot, digitalExtraZoom, capturedLocation, onResult)
                         } else {
                             onResult(null, "Errore scatto: ${exception.message}")
                         }
@@ -384,6 +406,7 @@ class FreshCameraEngine(
     private fun processAndSaveFrames(
         frames: List<Bitmap>,
         snapshot: FreshCamState,
+        digitalExtraZoom: Float,
         capturedLocation: Location?,
         onResult: (uriString: String?, message: String) -> Unit
     ) {
@@ -409,12 +432,10 @@ class FreshCameraEngine(
                         profile = snapshot.profile,
                         profileIntensity = snapshot.profileIntensity,
                         brightnessBoost = snapshot.brightnessBoost,
-                        aiMode = snapshot.aiMode,
-                        isTeleLens = snapshot.activeLens == LensType.TELE_50MP,
+                        aiPreset = snapshot.aiPreset,
+                        activeLens = snapshot.activeLens,
                         displayZoom = snapshot.displayZoom,
-                        lensZoomRatio = snapshot.lensZoomRatio,
-                        superResEnabled = snapshot.neuralSuperResEnabled,
-                        cloudAiEnabled = snapshot.cloudAiEnabled,
+                        digitalExtraZoom = digitalExtraZoom,
                         cloudEndpointUrl = snapshot.cloudEndpointUrl,
                         cloudApiKey = snapshot.cloudApiKey,
                         postSavePolish = snapshot.postSavePolishEnabled
@@ -425,8 +446,7 @@ class FreshCameraEngine(
 
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
                 val zoomTag = "${String.format(Locale.US, "%.1f", snapshot.displayZoom)}x"
-                val aiTag = if (snapshot.neuralSuperResEnabled) "_AI_${snapshot.aiMode.shortLabel}" else ""
-                val name = "FreshCam_${snapshot.profile.id}_${zoomTag}${aiTag}_$stamp.jpg"
+                val name = "FreshCam_${snapshot.profile.id}_${zoomTag}_$stamp.jpg"
 
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, name)
@@ -439,7 +459,7 @@ class FreshCameraEngine(
                 val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                 if (uri != null) {
                     context.contentResolver.openOutputStream(uri)?.use { out ->
-                        outcome.bitmap.compress(Bitmap.CompressFormat.JPEG, 98, out)
+                        outcome.bitmap.compress(Bitmap.CompressFormat.JPEG, snapshot.jpegQuality.coerceIn(85, 100), out)
                     }
                     if (!outcome.bitmap.isRecycled) outcome.bitmap.recycle()
 
@@ -494,7 +514,7 @@ class FreshCameraEngine(
         }
 
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ITALY).format(Date())
-        val name = "FreshCam_VID_${state.activeLens.name.lowercase()}_$stamp.mp4"
+        val name = "FreshCam_VID_${state.videoResolution.name}_${stamp}.mp4"
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
@@ -520,7 +540,7 @@ class FreshCameraEngine(
                 when (event) {
                     is VideoRecordEvent.Start -> {
                         onRecording(true)
-                        onBanner(if (state.stabilizationEnabled) "Video avviato (OIS+EIS)" else "Video avviato")
+                        onBanner("Video ${state.videoResolution.label} avviato (OIS+EIS)")
                     }
                     is VideoRecordEvent.Finalize -> {
                         onRecording(false)
@@ -552,7 +572,7 @@ class FreshCameraEngine(
 
         val yuv = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
         val out = ByteArrayOutputStream()
-        yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 98, out)
+        yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 99, out)
         val bytes = out.toByteArray()
         return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }

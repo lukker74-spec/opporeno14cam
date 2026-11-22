@@ -4,15 +4,22 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -38,18 +45,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Camera
 import androidx.compose.material.icons.filled.Cameraswitch
-import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
-import androidx.compose.material.icons.filled.HdrAuto
-import androidx.compose.material.icons.filled.LocationOff
-import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -61,7 +64,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -69,13 +71,17 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -83,18 +89,28 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.ln
+import kotlin.math.sin
 
 private enum class SheetPage {
     NONE,
+    AI_SELECTOR,
     PROFILE_FORMAT,
     FOCUS,
     SETTINGS
 }
 
-private fun resolveLensAndRatio(displayZoom: Float, currentLens: LensType, maxTeleRatio: Float): Pair<LensType, Float> {
+private fun resolveLensAndRatio(displayZoom: Float, currentLens: LensType): Pair<LensType, Float> {
     if (currentLens == LensType.FRONT) {
         return LensType.FRONT to displayZoom.coerceIn(1.0f, 2.0f)
     }
@@ -102,7 +118,7 @@ private fun resolveLensAndRatio(displayZoom: Float, currentLens: LensType, maxTe
         displayZoom < 0.95f -> LensType.ULTRAWIDE to 1.0f
         displayZoom < 3.45f -> LensType.MAIN_50MP to displayZoom.coerceIn(1.0f, 3.45f)
         else -> {
-            val ratio = (displayZoom / 3.5f).coerceIn(1.0f, maxTeleRatio)
+            val ratio = (displayZoom / 3.5f).coerceIn(1.0f, 120.0f / 3.5f)
             LensType.TELE_50MP to ratio
         }
     }
@@ -112,13 +128,30 @@ private fun resolveLensAndRatio(displayZoom: Float, currentLens: LensType, maxTe
 @Composable
 fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var state by remember { mutableStateOf(FreshCamState()) }
     var sheet by remember { mutableStateOf(SheetPage.NONE) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
     var focusRing by remember { mutableStateOf<Offset?>(null) }
     var flashPulse by remember { mutableStateOf(false) }
 
+    // Ghiera rotante zoom stile stock (compare al tocco/trascinamento e scompare dopo 2s di inattività)
+    var showZoomDial by remember { mutableStateOf(false) }
+    var dialHideJob by remember { mutableStateOf<Job?>(null) }
+
+    // Miniatura reale dell'ultima foto nel pulsante Galleria
+    var lastThumbBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
     val engine = remember(context, lifecycleOwner) { FreshCameraEngine(context, lifecycleOwner) }
+
+    fun pingZoomDial() {
+        showZoomDial = true
+        dialHideJob?.cancel()
+        dialHideJob = scope.launch {
+            delay(2200)
+            showZoomDial = false
+        }
+    }
 
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -128,8 +161,19 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         state = state.copy(
             hasLocationPermission = granted,
             locationTagEnabled = granted,
-            bannerMessage = if (granted) "Posizione GPS attivata nelle foto" else "Permesso posizione negato"
+            bannerMessage = if (granted) "Posizione GPS attivata" else "Permesso posizione negato"
         )
+    }
+
+    // Carica la miniatura reale quando cambia lastCapturedUri (e all'avvio dall'ultima foto in Galleria)
+    LaunchedEffect(state.lastCapturedUri) {
+        val uriStr = state.lastCapturedUri
+        val loaded = withContext(Dispatchers.IO) {
+            loadThumbnailBitmap(context, uriStr)
+        }
+        if (loaded != null) {
+            lastThumbBitmap = loaded
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -148,7 +192,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
     LaunchedEffect(state.bannerMessage) {
         if (state.bannerMessage != null) {
-            delay(4000)
+            delay(3500)
             state = state.copy(bannerMessage = null)
         }
     }
@@ -171,7 +215,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         previewView,
         state.activeLens,
         state.captureFormat,
-        state.aiMode,
+        state.videoResolution,
+        state.jpegQuality,
         state.stabilizationEnabled,
         state.isoValue,
         state.shutterSpeedDenom,
@@ -186,7 +231,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             previewView = pv,
             state = state,
             onZoomBounds = { _, maxZ ->
-                state = state.copy(maxLensZoomRatio = maxZ.coerceAtLeast(17.2f))
+                state = state.copy(maxLensZoomRatio = maxZ.coerceAtLeast(10.0f))
             },
             onBanner = { msg ->
                 state = state.copy(bannerMessage = msg)
@@ -199,6 +244,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        // Mirino Fotocamera
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -207,7 +253,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         focusRing = offset
                         if (state.focusMode == FocusMode.AI_LOCK) {
                             engine.applyFocusPoint(offset.x, offset.y, size.width.toFloat(), size.height.toFloat(), keepLocked = true)
-                            state = state.copy(isSubjectLocked = true, bannerMessage = "AI Lock agganciato sull'oggetto")
+                            state = state.copy(isSubjectLocked = true, bannerMessage = "AI Lock agganciato")
                         } else if (state.focusMode == FocusMode.AUTO) {
                             engine.applyFocusPoint(offset.x, offset.y, size.width.toFloat(), size.height.toFloat(), keepLocked = false)
                             state = state.copy(isSubjectLocked = false, bannerMessage = "Autofocus sul punto")
@@ -259,20 +305,38 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             if (flashPulse) {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.4f)))
             }
+
+            // Conto alla rovescia Autoscatto al centro dello schermo
+            if (state.countdownRemaining > 0) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "${state.countdownRemaining}",
+                        color = Color.White,
+                        fontSize = 92.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
         }
 
+        // BARRA SUPERIORE PULITA: tasto Impostazioni SEMPRE fisso in alto a destra!
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
                 .padding(horizontal = 8.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Row(
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // 1. Flash
                 IconButton(
                     onClick = {
                         val next = when (state.flashMode) {
@@ -295,72 +359,65 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
-                IconButton(
-                    onClick = {
-                        val next = when (state.hdrMode) {
-                            HdrMode.OFF -> HdrMode.NATURAL
-                            HdrMode.NATURAL -> HdrMode.AUTO
-                            HdrMode.AUTO -> HdrMode.OFF
-                        }
-                        state = state.copy(hdrMode = next, bannerMessage = next.label)
-                    }
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.HdrAuto,
-                        contentDescription = "HDR",
-                        tint = if (state.hdrMode == HdrMode.OFF) Color.White.copy(alpha = 0.75f) else state.profile.accentColor
-                    )
-                }
-
-                IconButton(
-                    onClick = {
-                        if (!state.locationTagEnabled) {
-                            if (state.hasLocationPermission) {
-                                state = state.copy(locationTagEnabled = true, bannerMessage = "Posizione GPS: ON")
-                            } else {
-                                locationPermissionLauncher.launch(
-                                    arrayOf(
-                                        Manifest.permission.ACCESS_FINE_LOCATION,
-                                        Manifest.permission.ACCESS_COARSE_LOCATION
-                                    )
-                                )
-                            }
-                        } else {
-                            state = state.copy(locationTagEnabled = false, bannerMessage = "Posizione GPS: OFF")
-                        }
-                    }
-                ) {
-                    Icon(
-                        imageVector = if (state.locationTagEnabled) Icons.Default.LocationOn else Icons.Default.LocationOff,
-                        contentDescription = "Posizione GPS",
-                        tint = if (state.locationTagEnabled) state.profile.accentColor else Color.White.copy(alpha = 0.75f)
-                    )
-                }
-
+                // 2. Autoscatto (Timer Off / 3s / 5s / 10s)
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
                         .background(
-                            if (state.neuralSuperResEnabled) Color(0xFF00ACC1).copy(alpha = 0.90f)
-                            else Color.Black.copy(alpha = 0.65f)
+                            if (state.timerMode != TimerMode.OFF) state.profile.accentColor.copy(alpha = 0.85f)
+                            else Color.Black.copy(alpha = 0.60f)
+                        )
+                        .clickable {
+                            val next = when (state.timerMode) {
+                                TimerMode.OFF -> TimerMode.SEC_3
+                                TimerMode.SEC_3 -> TimerMode.SEC_5
+                                TimerMode.SEC_5 -> TimerMode.SEC_10
+                                TimerMode.SEC_10 -> TimerMode.OFF
+                            }
+                            state = state.copy(timerMode = next, bannerMessage = "Autoscatto: ${next.label}")
+                        }
+                        .padding(horizontal = 8.dp, vertical = 6.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.Timer,
+                            contentDescription = "Autoscatto",
+                            tint = if (state.timerMode != TimerMode.OFF) Color.Black else Color.White,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        if (state.timerMode != TimerMode.OFF) {
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(state.timerMode.label, color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                // 3. UNICO TASTO AI (Off / Locale Bassa-Media-Alta / Cloud Bassa-Media-Alta)
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(
+                            when {
+                                !state.aiPreset.isEnabled -> Color.Black.copy(alpha = 0.65f)
+                                state.aiPreset.isCloud -> Color(0xFF7E57C2).copy(alpha = 0.92f)
+                                else -> Color(0xFF00ACC1).copy(alpha = 0.92f)
+                            }
                         )
                         .border(
                             1.dp,
-                            if (state.neuralSuperResEnabled) Color.White else Color.White.copy(alpha = 0.35f),
+                            if (state.aiPreset.isEnabled) Color.White else Color.White.copy(alpha = 0.35f),
                             RoundedCornerShape(16.dp)
                         )
-                        .clickable {
-                            val nextSr = !state.neuralSuperResEnabled
-                            val msg = if (nextSr) "AI MediaTek: ON (${state.aiMode.shortLabel})" else "AI: OFF"
-                            state = state.copy(neuralSuperResEnabled = nextSr, bannerMessage = msg)
-                        }
+                        .clickable { sheet = SheetPage.AI_SELECTOR }
                         .padding(horizontal = 10.dp, vertical = 6.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.dp))
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = if (state.neuralSuperResEnabled) "AI: ON" else "AI: OFF",
+                            text = state.aiPreset.shortBadge,
                             color = Color.White,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
@@ -368,67 +425,9 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
                 }
 
-                if (state.neuralSuperResEnabled) {
-                    Spacer(modifier = Modifier.width(5.dp))
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(Color(0xFF1A2634).copy(alpha = 0.90f))
-                            .border(1.dp, Color(0xFF26C6DA), RoundedCornerShape(16.dp))
-                            .clickable {
-                                val nextLevel = when (state.aiMode) {
-                                    AiMode.LOW -> AiMode.MEDIUM
-                                    AiMode.MEDIUM -> AiMode.AGGRESSIVE
-                                    AiMode.AGGRESSIVE -> AiMode.LOW
-                                }
-                                state = state.copy(aiMode = nextLevel, bannerMessage = "Livello AI: ${nextLevel.shortLabel}")
-                            }
-                            .padding(horizontal = 9.dp, vertical = 6.dp)
-                    ) {
-                        Text(
-                            text = state.aiMode.shortLabel,
-                            color = Color(0xFF80DEEA),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.width(5.dp))
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(
-                                if (state.cloudAiEnabled) Color(0xFF7E57C2).copy(alpha = 0.90f)
-                                else Color.Black.copy(alpha = 0.65f)
-                            )
-                            .border(
-                                1.dp,
-                                if (state.cloudAiEnabled) Color.White else Color.White.copy(alpha = 0.30f),
-                                RoundedCornerShape(16.dp)
-                            )
-                            .clickable {
-                                val nextCloud = !state.cloudAiEnabled
-                                if (nextCloud && state.cloudApiKey.isBlank()) {
-                                    state = state.copy(cloudAiEnabled = true, bannerMessage = "Inserisci il Token HF nelle Impostazioni")
-                                    sheet = SheetPage.SETTINGS
-                                } else {
-                                    val msg = if (nextCloud) "Cloud AI: ON" else "Cloud AI: OFF"
-                                    state = state.copy(cloudAiEnabled = nextCloud, bannerMessage = msg)
-                                }
-                            }
-                            .padding(horizontal = 8.dp, vertical = 6.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (state.cloudAiEnabled) Icons.Default.Cloud else Icons.Default.CloudOff,
-                            contentDescription = "Cloud AI",
-                            tint = Color.White,
-                            modifier = Modifier.size(14.dp)
-                        )
-                    }
-                }
-
                 Spacer(modifier = Modifier.width(6.dp))
 
+                // 4. Profilo Colore & Formato
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
@@ -447,12 +446,13 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                 Spacer(modifier = Modifier.width(6.dp))
 
+                // 5. Fuoco
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
                         .background(Color.Black.copy(alpha = 0.65f))
                         .clickable { sheet = SheetPage.FOCUS }
-                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                        .padding(horizontal = 9.dp, vertical = 6.dp)
                 ) {
                     Text(
                         text = state.focusMode.shortLabel,
@@ -463,15 +463,22 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 }
             }
 
+            Spacer(modifier = Modifier.width(6.dp))
+
+            // TASTO IMPOSTAZIONI FISSO E SEMPRE VISIBILE (Foto & Video)
             IconButton(
                 onClick = { sheet = SheetPage.SETTINGS },
-                modifier = Modifier.clip(CircleShape).background(Color.Black.copy(alpha = 0.55f))
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFF1A222D).copy(alpha = 0.90f))
+                    .border(1.dp, Color.White.copy(alpha = 0.35f), CircleShape)
             ) {
-                Icon(Icons.Default.Settings, contentDescription = "Impostazioni", tint = Color.White)
+                Icon(Icons.Default.Settings, contentDescription = "Impostazioni Foto e Video", tint = Color.White)
             }
         }
 
-        // Banner di stato ben visibile (sia durante l'elaborazione AI sia al salvataggio)
+        // Banner di stato
         val activeStatusText = state.persistentStatus ?: state.bannerMessage
         if (state.isSubjectLocked) {
             Box(
@@ -509,103 +516,86 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
+        // BLOCCO INFERIORE
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .background(Color.Black.copy(alpha = 0.68f))
-                .padding(top = 8.dp, bottom = 12.dp),
+                .background(Color.Black.copy(alpha = 0.72f))
+                .padding(top = 6.dp, bottom = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            // GHIERA ROTANTE ZOOM STILE STOCK (compare quando usi lo zoom e scompare da sola)
             if (state.activeLens != LensType.FRONT) {
-                val maxGlobalZoom = 60.0f
-                val maxTeleRatio = maxGlobalZoom / 3.5f
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                AnimatedVisibility(
+                    visible = showZoomDial,
+                    enter = fadeIn(),
+                    exit = fadeOut()
                 ) {
-                    Text(
-                        text = "${String.format(Locale.US, "%.1f", state.displayZoom)}x",
-                        color = state.profile.accentColor,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.width(52.dp)
-                    )
-                    Slider(
-                        value = state.displayZoom.coerceIn(0.6f, maxGlobalZoom),
-                        valueRange = 0.6f..maxGlobalZoom,
-                        onValueChange = { targetDisplay ->
-                            val (resolvedLens, resolvedRatio) = resolveLensAndRatio(
-                                displayZoom = targetDisplay,
-                                currentLens = state.activeLens,
-                                maxTeleRatio = maxTeleRatio
-                            )
+                    RotatingZoomDial(
+                        currentZoom = state.displayZoom,
+                        accentColor = state.profile.accentColor,
+                        onZoomChange = { newZoom ->
+                            pingZoomDial()
+                            val (resolvedLens, resolvedRatio) = resolveLensAndRatio(newZoom, state.activeLens)
                             state = state.copy(
-                                displayZoom = targetDisplay,
+                                displayZoom = newZoom,
                                 activeLens = resolvedLens,
                                 lensZoomRatio = resolvedRatio
                             )
-                        },
-                        modifier = Modifier.weight(1f),
-                        colors = SliderDefaults.colors(
-                            thumbColor = state.profile.accentColor,
-                            activeTrackColor = state.profile.accentColor
-                        )
-                    )
-                    Text(
-                        text = if (state.neuralSuperResEnabled) "NNAPI" else "AI OFF",
-                        color = if (state.neuralSuperResEnabled) Color(0xFF26C6DA) else Color.White.copy(alpha = 0.65f),
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(start = 6.dp)
+                        }
                     )
                 }
-            }
 
-            val presets = listOf(
-                Pair("0.6x", 0.6f),
-                Pair("1x", 1.0f),
-                Pair("3.5x", 3.5f),
-                Pair("10x", 10.0f),
-                Pair("30x", 30.0f),
-                Pair("60x", 60.0f)
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                presets.forEach { (label, targetDisplayZoom) ->
-                    val selected = state.activeLens != LensType.FRONT && abs(state.displayZoom - targetDisplayZoom) < 0.45f
-                    Box(
-                        modifier = Modifier
-                            .padding(horizontal = 3.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(if (selected) state.profile.accentColor else Color.DarkGray.copy(alpha = 0.72f))
-                            .clickable {
-                                val (resolvedLens, resolvedRatio) = resolveLensAndRatio(
-                                    displayZoom = targetDisplayZoom,
-                                    currentLens = LensType.MAIN_50MP,
-                                    maxTeleRatio = 60.0f / 3.5f
-                                )
-                                state = state.copy(
-                                    displayZoom = targetDisplayZoom,
-                                    activeLens = resolvedLens,
-                                    lensZoomRatio = resolvedRatio,
-                                    bannerMessage = "${resolvedLens.label} ($label)"
-                                )
-                            }
-                            .padding(horizontal = 9.dp, vertical = 5.dp)
-                    ) {
-                        Text(label, color = if (selected) Color.Black else Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                // Preset rapidi zoom fino a 120x (toccare apre anche la ghiera rotante per regolazione fine)
+                val presets = listOf(
+                    Pair("0.6x", 0.6f),
+                    Pair("1x", 1.0f),
+                    Pair("3.5x", 3.5f),
+                    Pair("7x", 7.0f),
+                    Pair("20x", 20.0f),
+                    Pair("60x", 60.0f),
+                    Pair("120x", 120.0f)
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    presets.forEach { (label, targetDisplayZoom) ->
+                        val selected = abs(state.displayZoom - targetDisplayZoom) < (if (targetDisplayZoom >= 20f) 4f else 0.45f)
+                        Box(
+                            modifier = Modifier
+                                .padding(horizontal = 3.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(if (selected) state.profile.accentColor else Color.DarkGray.copy(alpha = 0.72f))
+                                .clickable {
+                                    pingZoomDial()
+                                    val (resolvedLens, resolvedRatio) = resolveLensAndRatio(targetDisplayZoom, LensType.MAIN_50MP)
+                                    state = state.copy(
+                                        displayZoom = targetDisplayZoom,
+                                        activeLens = resolvedLens,
+                                        lensZoomRatio = resolvedRatio
+                                    )
+                                }
+                                .padding(horizontal = 9.dp, vertical = 5.dp)
+                        ) {
+                            Text(label, color = if (selected) Color.Black else Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
                     }
                 }
             }
 
+            // Modalità pulite: Foto · Video · Ritratto · Notte
             Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(18.dp, Alignment.CenterHorizontally)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(24.dp, Alignment.CenterHorizontally)
             ) {
                 ShootingMode.entries.forEach { mode ->
                     val selected = state.shootingMode == mode
@@ -616,17 +606,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
                         modifier = Modifier
                             .clickable {
-                                if (mode == ShootingMode.TELE_50MP) {
-                                    state = state.copy(
-                                        shootingMode = mode,
-                                        activeLens = LensType.TELE_50MP,
-                                        displayZoom = 3.5f,
-                                        lensZoomRatio = 1.0f,
-                                        bannerMessage = "Modalità Tele 50MP (3.5x)"
-                                    )
-                                } else {
-                                    state = state.copy(shootingMode = mode, bannerMessage = "Modalità ${mode.label}")
-                                }
+                                state = state.copy(shootingMode = mode, bannerMessage = "Modalità ${mode.label}")
                             }
                             .padding(vertical = 3.dp)
                     )
@@ -635,16 +615,19 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
             Spacer(modifier = Modifier.height(6.dp))
 
+            // Pulsanti inferiori: Anteprima Galleria reale · Scatto · Cambio Camera
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 28.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // ANTEPRIMA REALE DELL'ULTIMA FOTO NELLA GALLERIA
                 Box(
                     modifier = Modifier
-                        .size(46.dp)
+                        .size(48.dp)
                         .clip(CircleShape)
                         .background(Color.White.copy(alpha = 0.14f))
+                        .border(1.5.dp, Color.White.copy(alpha = 0.6f), CircleShape)
                         .clickable {
                             openOppoGallery(context, state.lastCapturedUri) { err ->
                                 state = state.copy(bannerMessage = err)
@@ -652,9 +635,20 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Default.PhotoLibrary, contentDescription = "Galleria Oppo", tint = Color.White, modifier = Modifier.size(22.dp))
+                    val bmp = lastThumbBitmap
+                    if (bmp != null) {
+                        Image(
+                            bitmap = bmp.asImageBitmap(),
+                            contentDescription = "Ultima foto in Galleria",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize().clip(CircleShape)
+                        )
+                    } else {
+                        Icon(Icons.Default.PhotoLibrary, contentDescription = "Galleria Oppo", tint = Color.White, modifier = Modifier.size(22.dp))
+                    }
                 }
 
+                // PULSANTE SCATTO (supporta Autoscatto Timer)
                 Box(
                     modifier = Modifier
                         .size(74.dp)
@@ -670,6 +664,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             }
                         )
                         .clickable {
+                            if (state.countdownRemaining > 0) return@clickable
                             if (state.shootingMode == ShootingMode.VIDEO) {
                                 engine.toggleVideo(
                                     state = state,
@@ -677,21 +672,36 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                                     onBanner = { msg -> state = state.copy(bannerMessage = msg) }
                                 )
                             } else {
-                                flashPulse = true
-                                val snap = state
-                                engine.shootInstant(
-                                    snapshot = snap,
-                                    onStatus = { busyMsg ->
-                                        state = state.copy(persistentStatus = busyMsg)
-                                    },
-                                    onResult = { uri, msg ->
-                                        state = state.copy(
-                                            persistentStatus = null,
-                                            lastCapturedUri = uri ?: state.lastCapturedUri,
-                                            bannerMessage = msg
-                                        )
+                                val triggerCapture = {
+                                    flashPulse = true
+                                    val snap = state
+                                    engine.shootInstant(
+                                        snapshot = snap,
+                                        onStatus = { busyMsg ->
+                                            state = state.copy(persistentStatus = busyMsg)
+                                        },
+                                        onResult = { uri, msg ->
+                                            state = state.copy(
+                                                persistentStatus = null,
+                                                lastCapturedUri = uri ?: state.lastCapturedUri,
+                                                bannerMessage = msg
+                                            )
+                                        }
+                                    )
+                                }
+
+                                if (state.timerMode.seconds > 0) {
+                                    scope.launch {
+                                        for (sec in state.timerMode.seconds downTo 1) {
+                                            state = state.copy(countdownRemaining = sec)
+                                            delay(1000)
+                                        }
+                                        state = state.copy(countdownRemaining = 0)
+                                        triggerCapture()
                                     }
-                                )
+                                } else {
+                                    triggerCapture()
+                                }
                             }
                         },
                     contentAlignment = Alignment.Center
@@ -708,9 +718,10 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
+                // CAMBIO CAMERA
                 Box(
                     modifier = Modifier
-                        .size(46.dp)
+                        .size(48.dp)
                         .clip(CircleShape)
                         .background(Color.White.copy(alpha = 0.14f))
                         .clickable {
@@ -737,6 +748,64 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
+        // MENU UNIFICATO AI (7 stati in un solo posto pulito)
+        if (sheet == SheetPage.AI_SELECTOR) {
+            ModalBottomSheet(
+                onDismissRequest = { sheet = SheetPage.NONE },
+                containerColor = Color(0xFF141619),
+                contentColor = Color.White
+            ) {
+                Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)) {
+                    Text("Motore AI (Locale & Cloud)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    Text("Unico selettore: Off, Locale (MediaTek NNAPI) oppure Cloud", fontSize = 12.sp, color = Color.White.copy(alpha = 0.65f))
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    FilterChip(
+                        selected = state.aiPreset == UnifiedAiPreset.OFF,
+                        onClick = {
+                            state = state.copy(aiPreset = UnifiedAiPreset.OFF, bannerMessage = "AI Disattivata")
+                            sheet = SheetPage.NONE
+                        },
+                        label = { Text("AI Off (Ottica Pura)") }
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("AI Locale (sul telefono · MediaTek APU 780)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(UnifiedAiPreset.LOCAL_LOW, UnifiedAiPreset.LOCAL_MED, UnifiedAiPreset.LOCAL_HIGH).forEach { preset ->
+                            FilterChip(
+                                selected = state.aiPreset == preset,
+                                onClick = {
+                                    state = state.copy(aiPreset = preset, bannerMessage = preset.fullLabel)
+                                    sheet = SheetPage.NONE
+                                },
+                                label = { Text(preset.shortBadge) }
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("AI in Cloud (Ricostruzione remota avanzata)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB39DDB))
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(UnifiedAiPreset.CLOUD_LOW, UnifiedAiPreset.CLOUD_MED, UnifiedAiPreset.CLOUD_HIGH).forEach { preset ->
+                            FilterChip(
+                                selected = state.aiPreset == preset,
+                                onClick = {
+                                    state = state.copy(aiPreset = preset, bannerMessage = preset.fullLabel)
+                                    sheet = SheetPage.NONE
+                                },
+                                label = { Text(preset.shortBadge) }
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(24.dp))
+                }
+            }
+        }
+
+        // PROFILI COLORE & FORMATO
         if (sheet == SheetPage.PROFILE_FORMAT) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -795,6 +864,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
+        // MESSA A FUOCO
         if (sheet == SheetPage.FOCUS) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -826,6 +896,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
+        // IMPOSTAZIONI COMPLETE FOTO & VIDEO
         if (sheet == SheetPage.SETTINGS) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -838,67 +909,58 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         .verticalScroll(rememberScrollState())
                         .padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
-                    Text("Impostazioni Reno14 FreshCam", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                    Text(
-                        text = if (state.isNeuralModelReady) "Acceleratore: ${state.activeAccelerator} (${state.loadedModelName})" else "Motore AI locale attivo",
-                        fontSize = 12.sp,
-                        color = Color(0xFF4FC3F7)
-                    )
+                    Text("Impostazioni Foto & Video (v12)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("NPU: ${state.activeAccelerator} · Zoom fino a 120x", fontSize = 12.sp, color = Color(0xFF4FC3F7))
+
+                    Spacer(modifier = Modifier.height(14.dp))
+                    HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Text("IMPOSTAZIONI VIDEO", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF80DEEA))
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text("Risoluzione Video", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        VideoResolution.entries.forEach { res ->
+                            FilterChip(
+                                selected = state.videoResolution == res,
+                                onClick = { state = state.copy(videoResolution = res, bannerMessage = "Video: ${res.label}") },
+                                label = { Text(res.label) }
+                            )
+                        }
+                    }
 
                     Spacer(modifier = Modifier.height(12.dp))
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Text("IMPOSTAZIONI FOTO & OTTICA", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF80DEEA))
+                    Spacer(modifier = Modifier.height(6.dp))
 
                     ToggleRow(
-                        title = "AI Locale Ottimizzata MediaTek (NNAPI)",
-                        subtitle = "Leggera e naturale a 1x, più spinta e mirata sul soggetto allo zoom 8x–60x",
-                        checked = state.neuralSuperResEnabled,
-                        onChange = { state = state.copy(neuralSuperResEnabled = it) }
+                        title = "Stabilizzazione Ottica + Elettronica (OIS + EIS)",
+                        subtitle = "Sfrutta al massimo l'OIS su Principale 50MP e Tele 50MP in foto e video",
+                        checked = state.stabilizationEnabled,
+                        onChange = { state = state.copy(stabilizationEnabled = it) }
                     )
 
-                    if (state.neuralSuperResEnabled) {
-                        Text("Intensità AI Locale: ${state.aiMode.shortLabel}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF80DEEA))
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            AiMode.entries.forEach { mode ->
-                                FilterChip(
-                                    selected = state.aiMode == mode,
-                                    onClick = { state = state.copy(aiMode = mode) },
-                                    label = { Text(mode.shortLabel) }
-                                )
-                            }
-                        }
-                        Spacer(modifier = Modifier.height(8.dp))
-                    }
-
-                    ToggleRow(
-                        title = "AI Generativa in Cloud (Opzionale)",
-                        subtitle = "Richiede un Token gratuito Hugging Face (hf_...). Mostra l'esito nel banner di salvataggio",
-                        checked = state.cloudAiEnabled,
-                        onChange = { state = state.copy(cloudAiEnabled = it) }
+                    Text("Qualità JPEG: ${state.jpegQuality}%", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Slider(
+                        value = state.jpegQuality.toFloat(),
+                        valueRange = 85f..100f,
+                        onValueChange = { state = state.copy(jpegQuality = it.toInt()) }
                     )
 
-                    if (state.cloudAiEnabled) {
-                        OutlinedTextField(
-                            value = state.cloudApiKey,
-                            onValueChange = { state = state.copy(cloudApiKey = it) },
-                            label = { Text("Token API Hugging Face (hf_...)") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                        )
-                        OutlinedTextField(
-                            value = state.cloudEndpointUrl,
-                            onValueChange = { state = state.copy(cloudEndpointUrl = it) },
-                            label = { Text("URL Endpoint Cloud SR") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                    }
+                    ToggleRow(
+                        title = "Bilanciamento Tonale Colore Reale",
+                        subtitle = "Protegge le alte luci mantenendo fedeltà cromatica",
+                        checked = state.postSavePolishEnabled,
+                        onChange = { state = state.copy(postSavePolishEnabled = it) }
+                    )
 
                     ToggleRow(
-                        title = "Informazioni di Posizione (GPS EXIF)",
-                        subtitle = "Salva le coordinate geografiche nei metadati di foto e video",
+                        title = "Posizione GPS nei metadati (EXIF)",
+                        subtitle = "Salva le coordinate geografiche in foto e video",
                         checked = state.locationTagEnabled,
                         onChange = { enable ->
                             if (enable && !state.hasLocationPermission) {
@@ -915,35 +977,39 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
 
                     ToggleRow(
-                        title = "Ottimizzazione al Salvataggio (disattivabile)",
-                        subtitle = "Bilancia ombre e alte luci in background",
-                        checked = state.postSavePolishEnabled,
-                        onChange = { state = state.copy(postSavePolishEnabled = it) }
-                    )
-
-                    ToggleRow(
-                        title = "Stabilizzazione Avanzata (OIS + EIS)",
-                        subtitle = "Stabilizzazione ottica ed elettronica su foto e video",
-                        checked = state.stabilizationEnabled,
-                        onChange = { state = state.copy(stabilizationEnabled = it) }
-                    )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-                    val lightPct = (state.brightnessBoost * 100).toInt()
-                    Text("Luminosità foto: ${if (lightPct >= 0) "+$lightPct%" else "$lightPct%"}", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                    Slider(value = state.brightnessBoost, valueRange = -0.10f..0.30f, onValueChange = { state = state.copy(brightnessBoost = it) })
-
-                    Text("Esposizione (EV): ${if (state.evCompensation >= 0) "+${state.evCompensation}" else "${state.evCompensation}"}", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                    Slider(value = state.evCompensation.toFloat(), valueRange = -2f..3f, onValueChange = { state = state.copy(evCompensation = it.toInt()) })
-
-                    Text("Intensità Profilo (${state.profile.displayName}): ${(state.profileIntensity * 100).toInt()}%", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                    Slider(value = state.profileIntensity, valueRange = 0.2f..1.5f, onValueChange = { state = state.copy(profileIntensity = it) })
-
-                    ToggleRow(
                         title = "Griglia 3x3",
                         subtitle = "Guide composizione sul mirino",
                         checked = state.gridEnabled,
                         onChange = { state = state.copy(gridEnabled = it) }
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    val lightPct = (state.brightnessBoost * 100).toInt()
+                    Text("Luminosità foto: ${if (lightPct >= 0) "+$lightPct%" else "$lightPct%"}", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Slider(value = state.brightnessBoost, valueRange = -0.15f..0.20f, onValueChange = { state = state.copy(brightnessBoost = it) })
+
+                    Text("Esposizione (EV): ${if (state.evCompensation >= 0) "+${state.evCompensation}" else "${state.evCompensation}"}", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Slider(value = state.evCompensation.toFloat(), valueRange = -2f..3f, onValueChange = { state = state.copy(evCompensation = it.toInt()) })
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Text("CONFIGURAZIONE CLOUD AI", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB39DDB))
+                    Spacer(modifier = Modifier.height(6.dp))
+                    OutlinedTextField(
+                        value = state.cloudApiKey,
+                        onValueChange = { state = state.copy(cloudApiKey = it) },
+                        label = { Text("Token API Hugging Face (hf_...)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                    )
+                    OutlinedTextField(
+                        value = state.cloudEndpointUrl,
+                        onValueChange = { state = state.copy(cloudEndpointUrl = it) },
+                        label = { Text("URL Endpoint Cloud SR") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                     )
 
                     Spacer(modifier = Modifier.height(14.dp))
@@ -958,6 +1024,119 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 }
             }
         }
+    }
+}
+
+/**
+ * Selettore di zoom a ghiera rotante (stile fotocamera stock Oppo) fino a 120x.
+ * Scala logaritmica fluida così da avere controllo preciso tra 0.6x–7x e scorrevole fino a 120x.
+ */
+@Composable
+private fun RotatingZoomDial(
+    currentZoom: Float,
+    accentColor: Color,
+    onZoomChange: (Float) -> Unit
+) {
+    val minZ = 0.6f
+    val maxZ = 120.0f
+    val lnMin = ln(minZ.toDouble())
+    val lnMax = ln(maxZ.toDouble())
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(78.dp)
+            .pointerInput(currentZoom) {
+                detectHorizontalDragGestures { change, dragAmount ->
+                    change.consume()
+                    val norm = ((ln(currentZoom.coerceIn(minZ, maxZ).toDouble()) - lnMin) / (lnMax - lnMin)).toFloat()
+                    val delta = -dragAmount / 520f
+                    val nextNorm = (norm + delta).coerceIn(0f, 1f)
+                    val nextZoom = exp(lnMin + nextNorm * (lnMax - lnMin)).toFloat().coerceIn(minZ, maxZ)
+                    onZoomChange(nextZoom)
+                }
+            },
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val cx = size.width / 2f
+            val radius = size.width * 0.72f
+            val cy = radius + 24f
+
+            val norm = ((ln(currentZoom.coerceIn(minZ, maxZ).toDouble()) - lnMin) / (lnMax - lnMin)).toFloat()
+
+            // Tacche graduate lungo l'arco che ruotano con lo zoom
+            for (i in -18..18) {
+                val angleDeg = i * 2.2f - (norm * 40f % 2.2f)
+                val rad = (angleDeg - 90.0) * PI / 180.0
+                val isMajor = (i % 5 == 0)
+                val innerR = radius - if (isMajor) 22f else 12f
+                val start = Offset(cx + (radius * cos(rad)).toFloat(), cy + (radius * sin(rad)).toFloat())
+                val end = Offset(cx + (innerR * cos(rad)).toFloat(), cy + (innerR * sin(rad)).toFloat())
+                drawLine(
+                    color = if (isMajor) Color.White.copy(alpha = 0.85f) else Color.White.copy(alpha = 0.35f),
+                    start = start,
+                    end = end,
+                    strokeWidth = if (isMajor) 2.5f else 1.5f,
+                    cap = StrokeCap.Round
+                )
+            }
+
+            // Indicatore centrale fisso
+            drawLine(
+                color = accentColor,
+                start = Offset(cx, 18f),
+                end = Offset(cx, 48f),
+                strokeWidth = 4f,
+                cap = StrokeCap.Round
+            )
+        }
+
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.Black.copy(alpha = 0.75f))
+                .border(1.dp, accentColor, RoundedCornerShape(12.dp))
+                .padding(horizontal = 10.dp, vertical = 2.dp)
+        ) {
+            Text(
+                text = "${String.format(Locale.US, "%.1f", currentZoom)}x",
+                color = accentColor,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+private fun loadThumbnailBitmap(context: Context, uriString: String?): Bitmap? {
+    return try {
+        val targetUri: Uri? = if (uriString != null) {
+            Uri.parse(uriString)
+        } else {
+            val projection = arrayOf(MediaStore.Images.Media._ID)
+            val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+            context.contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                null,
+                null,
+                sortOrder
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val id = cursor.getLong(0)
+                    Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
+                } else null
+            }
+        }
+        if (targetUri == null) return null
+        val opts = BitmapFactory.Options().apply { inSampleSize = 8 }
+        context.contentResolver.openInputStream(targetUri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, opts)
+        }
+    } catch (_: Throwable) {
+        null
     }
 }
 
