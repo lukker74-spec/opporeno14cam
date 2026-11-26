@@ -102,6 +102,7 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.ln
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 private enum class SheetPage {
@@ -175,11 +176,16 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
     }
 
     LaunchedEffect(Unit) {
-        val lenses = withContext(Dispatchers.IO) { engine.discoverLenses() }
+        val (lenses, sensorReport) = withContext(Dispatchers.IO) {
+            val l = engine.discoverLenses()
+            val r = engine.inspectSensorCapabilities()
+            l to r
+        }
         val hasLoc = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         state = state.copy(
             detectedLenses = lenses,
+            sensorCapabilitiesReport = sensorReport,
             hasLocationPermission = hasLoc
         )
     }
@@ -424,9 +430,9 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 Spacer(modifier = Modifier.width(6.dp))
 
                 val aiButtonText = when {
-                    !state.aiPreset.isEnabled -> "AI Off"
                     state.activeHardwareExtension != null && !state.aiPreset.isCloud -> state.activeHardwareExtension!!
                     state.activeHardwareExtension != null && state.aiPreset.isCloud -> "${state.activeHardwareExtension}+Cloud"
+                    !state.aiPreset.isEnabled -> "AI Off"
                     else -> state.aiPreset.shortBadge
                 }
                 Box(
@@ -434,15 +440,15 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         .clip(RoundedCornerShape(16.dp))
                         .background(
                             when {
+                                state.activeHardwareExtension != null && !state.aiPreset.isCloud -> Color(0xFF2E7D32).copy(alpha = 0.92f)
                                 !state.aiPreset.isEnabled -> Color.Black.copy(alpha = 0.65f)
                                 state.aiPreset.isCloud -> Color(0xFF7E57C2).copy(alpha = 0.92f)
-                                state.activeHardwareExtension != null -> Color(0xFF2E7D32).copy(alpha = 0.92f)
                                 else -> Color(0xFF00ACC1).copy(alpha = 0.92f)
                             }
                         )
                         .border(
                             1.dp,
-                            if (state.aiPreset.isEnabled) Color.White else Color.White.copy(alpha = 0.35f),
+                            if (state.aiPreset.isEnabled || state.activeHardwareExtension != null) Color.White else Color.White.copy(alpha = 0.35f),
                             RoundedCornerShape(16.dp)
                         )
                         .clickable { sheet = SheetPage.AI_SELECTOR }
@@ -782,7 +788,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 contentColor = Color.White
             ) {
                 Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)) {
-                    Text("Motore AI v15 (Burst Tele 3.5x+ · HW · Cloud)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    Text("Motore AI v16 (JPEG Diretto · Burst 1px · Cloud)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
                     Text(
                         text = state.hwExtensionsReport,
                         fontSize = 11.sp,
@@ -793,14 +799,14 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     FilterChip(
                         selected = state.aiPreset == UnifiedAiPreset.OFF,
                         onClick = {
-                            state = state.copy(aiPreset = UnifiedAiPreset.OFF, bannerMessage = "AI Disattivata")
+                            state = state.copy(aiPreset = UnifiedAiPreset.OFF, bannerMessage = "AI Off (JPEG diretto)")
                             sheet = SheetPage.NONE
                         },
-                        label = { Text("AI Off (Ottica Pura)") }
+                        label = { Text("AI Off (JPEG Diretto dal sensore)") }
                     )
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("AI Hardware / Locale (Burst 3x–4x da 3.5x + HW Notte su Alta)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
+                    Text("AI Locale (Allineamento Burst 1px · Pieni 12MP)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(UnifiedAiPreset.LOCAL_LOW, UnifiedAiPreset.LOCAL_MED, UnifiedAiPreset.LOCAL_HIGH).forEach { preset ->
@@ -816,7 +822,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("AI Generativa in Cloud (Replicate Real-ESRGAN)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB39DDB))
+                    Text("AI Generativa in Cloud (Opzionale)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB39DDB))
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(UnifiedAiPreset.CLOUD_LOW, UnifiedAiPreset.CLOUD_MED, UnifiedAiPreset.CLOUD_HIGH).forEach { preset ->
@@ -835,7 +841,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // PROFILI COLORE & FORMATO
+        // PROFILI COLORE & FORMATO (Modalità Pro migliorata a scatti fotografici)
         if (sheet == SheetPage.PROFILE_FORMAT) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -843,7 +849,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 contentColor = Color.White
             ) {
                 Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)) {
-                    Text("Tipo di scatto", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    Text("Tipo di scatto (JPEG leggero di default)", fontSize = 15.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         CaptureFormat.entries.forEach { fmt ->
@@ -856,18 +862,29 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
 
                     if (state.captureFormat == CaptureFormat.PRO) {
+                        val isoIdx = PRO_ISO_STOPS.indexOf(state.isoValue).let { if (it >= 0) it else 5 }
+                        val shutterIdx = PRO_SHUTTER_DENOMS.indexOf(state.shutterSpeedDenom).let { if (it >= 0) it else 6 }
+
                         Spacer(modifier = Modifier.height(10.dp))
-                        Text("ISO ${state.isoValue}", fontSize = 12.sp, color = state.profile.accentColor)
+                        Text("ISO ${state.isoValue}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = state.profile.accentColor)
                         Slider(
-                            value = state.isoValue.toFloat(),
-                            valueRange = 50f..3200f,
-                            onValueChange = { state = state.copy(isoValue = (it.toInt() / 50) * 50) }
+                            value = isoIdx.toFloat(),
+                            valueRange = 0f..(PRO_ISO_STOPS.size - 1).toFloat(),
+                            steps = PRO_ISO_STOPS.size - 2,
+                            onValueChange = { idx ->
+                                val picked = PRO_ISO_STOPS[idx.roundToInt().coerceIn(0, PRO_ISO_STOPS.lastIndex)]
+                                state = state.copy(isoValue = picked)
+                            }
                         )
-                        Text("Tempo 1/${state.shutterSpeedDenom}s", fontSize = 12.sp, color = state.profile.accentColor)
+                        Text("Tempo 1/${state.shutterSpeedDenom}s", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = state.profile.accentColor)
                         Slider(
-                            value = state.shutterSpeedDenom.toFloat(),
-                            valueRange = 4f..2000f,
-                            onValueChange = { state = state.copy(shutterSpeedDenom = it.toInt().coerceAtLeast(4)) }
+                            value = shutterIdx.toFloat(),
+                            valueRange = 0f..(PRO_SHUTTER_DENOMS.size - 1).toFloat(),
+                            steps = PRO_SHUTTER_DENOMS.size - 2,
+                            onValueChange = { idx ->
+                                val picked = PRO_SHUTTER_DENOMS[idx.roundToInt().coerceIn(0, PRO_SHUTTER_DENOMS.lastIndex)]
+                                state = state.copy(shutterSpeedDenom = picked)
+                            }
                         )
                     }
 
@@ -926,7 +943,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // IMPOSTAZIONI FOTO, VIDEO, SBLOCCO HW & CLOUD
+        // IMPOSTAZIONI FOTO, VIDEO & DIAGNOSTICA SENSORI
         if (sheet == SheetPage.SETTINGS) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -939,17 +956,19 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         .verticalScroll(rememberScrollState())
                         .padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
-                    Text("Impostazioni Foto & Video (v15)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("Impostazioni Foto & Video (v16)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Spacer(modifier = Modifier.height(4.dp))
                     Text("Estensioni HW: ${state.hwExtensionsReport}", fontSize = 11.sp, color = Color(0xFF81C784))
+                    Text("Sensori: ${state.sensorCapabilitiesReport}", fontSize = 11.sp, color = Color(0xFF4FC3F7))
 
                     Spacer(modifier = Modifier.height(14.dp))
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    Text("SBLOCCO ESTENSIONI HARDWARE", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF81C784))
+                    Text("ESTENSIONI HARDWARE (NOTTE / RITRATTO)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF81C784))
                     ToggleRow(
                         title = "Forza Camera Logica per Estensioni HW",
-                        subtitle = "Usa la camera logica Oppo (invece dell'ID fisico) per mantenere attive le estensioni HW anche sullo zoom",
+                        subtitle = "Usa la camera logica Oppo per HW Notte e HW Bokeh (in Foto diurna non forza più Notte)",
                         checked = state.forceLogicalHwExtensions,
                         onChange = { state = state.copy(forceLogicalHwExtensions = it) }
                     )
@@ -980,8 +999,8 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     Spacer(modifier = Modifier.height(6.dp))
 
                     ToggleRow(
-                        title = "Stabilizzazione Ottica + Elettronica (OIS + EIS)",
-                        subtitle = "OIS al massimo su Principale 50MP e Tele 50MP in foto e video",
+                        title = "Stabilizzazione (OIS in Foto · OIS+EIS in Video)",
+                        subtitle = "In modalità Foto usa solo OIS ottico puro senza ritaglio video EIS",
                         checked = state.stabilizationEnabled,
                         onChange = { state = state.copy(stabilizationEnabled = it) }
                     )
@@ -995,7 +1014,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                     ToggleRow(
                         title = "Curva Tonale Cinematografica",
-                        subtitle = "Aggiunge una leggera curva a S al salvataggio",
+                        subtitle = "Aggiunge una leggera curva a S al salvataggio (Off = JPEG diretto senza ricompressione)",
                         checked = state.postSavePolishEnabled,
                         onChange = { state = state.copy(postSavePolishEnabled = it) }
                     )
@@ -1037,7 +1056,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    Text("CLOUD AI GENERATIVA (REPLICATE / HF)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB39DDB))
+                    Text("CLOUD AI GENERATIVA (OPZIONALE)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB39DDB))
                     Spacer(modifier = Modifier.height(6.dp))
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         CloudModelPreset.entries.forEach { preset ->

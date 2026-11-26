@@ -48,13 +48,16 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.exifinterface.media.ExifInterface
 import androidx.lifecycle.LifecycleOwner
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 class FreshCameraEngine(
     private val context: Context,
@@ -78,6 +81,26 @@ class FreshCameraEngine(
 
     private var discoveredLenses: List<PhysicalLensInfo> = emptyList()
 
+    private val exifTagsToCopy = listOf(
+        ExifInterface.TAG_MAKE,
+        ExifInterface.TAG_MODEL,
+        ExifInterface.TAG_DATETIME,
+        ExifInterface.TAG_DATETIME_ORIGINAL,
+        ExifInterface.TAG_DATETIME_DIGITIZED,
+        ExifInterface.TAG_EXPOSURE_TIME,
+        ExifInterface.TAG_F_NUMBER,
+        ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY,
+        ExifInterface.TAG_FOCAL_LENGTH,
+        ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM,
+        ExifInterface.TAG_WHITE_BALANCE,
+        ExifInterface.TAG_FLASH,
+        ExifInterface.TAG_METERING_MODE,
+        ExifInterface.TAG_EXPOSURE_BIAS_VALUE,
+        ExifInterface.TAG_DIGITAL_ZOOM_RATIO,
+        ExifInterface.TAG_APERTURE_VALUE,
+        ExifInterface.TAG_SHUTTER_SPEED_VALUE
+    )
+
     fun discoverLenses(): List<PhysicalLensInfo> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val list = mutableListOf<PhysicalLensInfo>()
@@ -98,7 +121,7 @@ class FreshCameraEngine(
 
             val mainCam = backCandidates.firstOrNull { it.first == "0" && it.second in 3.5f..7.0f }
                 ?: backCandidates.firstOrNull { it.second in 3.8f..6.8f }
-                ?: backCandidates.minByOrNull { kotlin.math.abs(it.second - 5.0f) }
+                ?: backCandidates.minByOrNull { abs(it.second - 5.0f) }
 
             val ultraCam = backCandidates
                 .filter { it.first != mainCam?.first && it.second < (mainCam?.second ?: 4.5f) - 0.8f }
@@ -118,6 +141,52 @@ class FreshCameraEngine(
         return list
     }
 
+    /**
+     * Diagnostica in sola lettura: controlla se ColorOS espone 50MP reali e RAW_SENSOR
+     * su Principale 1x e Tele 3.5x (non salva alcun file RAW di default!).
+     */
+    fun inspectSensorCapabilities(): String {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        if (discoveredLenses.isEmpty()) discoverLenses()
+
+        fun inspectLens(label: String, lensType: LensType): String {
+            val info = discoveredLenses.firstOrNull { it.lensType == lensType } ?: return "$label: N/D"
+            return try {
+                val chars = manager.getCameraCharacteristics(info.cameraId)
+                val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val stdMax = map?.getOutputSizes(ImageFormat.JPEG)
+                    ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+
+                var hiResMax = stdMax
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val maxMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+                    val maxJpeg = maxMap?.getOutputSizes(ImageFormat.JPEG)
+                        ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                    if (maxJpeg != null && (hiResMax == null || maxJpeg.width.toLong() * maxJpeg.height > hiResMax.width.toLong() * hiResMax.height)) {
+                        hiResMax = maxJpeg
+                    }
+                }
+
+                val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+                val hasRawCap = caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)
+                val rawMax = map?.getOutputSizes(ImageFormat.RAW_SENSOR)
+                    ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+
+                val mpStd = stdMax?.let { ((it.width.toLong() * it.height) / 1_000_000.0).roundToInt() } ?: 0
+                val mpHi = hiResMax?.let { ((it.width.toLong() * it.height) / 1_000_000.0).roundToInt() } ?: mpStd
+                val mpText = if (mpHi > mpStd) "${mpStd}MP(max ${mpHi}MP)" else "${mpStd}MP"
+                val rawText = if (hasRawCap && rawMax != null) "RAW SI" else "RAW NO"
+                "$label(ID${info.cameraId}): $mpText · $rawText"
+            } catch (_: Throwable) {
+                "$label: errore"
+            }
+        }
+
+        val mainRep = inspectLens("1x", LensType.MAIN_50MP)
+        val teleRep = inspectLens("Tele", LensType.TELE_50MP)
+        return "$mainRep | $teleRep"
+    }
+
     @SuppressLint("RestrictedApi", "UnsafeOptInUsageError")
     private fun selectorForLens(lensType: LensType): CameraSelector {
         if (lensType == LensType.FRONT) return CameraSelector.DEFAULT_FRONT_CAMERA
@@ -133,10 +202,6 @@ class FreshCameraEngine(
         return CameraSelector.DEFAULT_BACK_CAMERA
     }
 
-    /**
-     * Scansione profonda v15: verifica sia CameraX Extensions su DEFAULT_BACK_CAMERA (logica)
-     * sia le Camera2 CameraExtensionCharacteristics (Android 12+) su ogni ID fisico!
-     */
     private fun buildDeepExtensionsReport(extMgr: ExtensionsManager): String {
         fun probeCx(label: String, sel: CameraSelector): String {
             val found = mutableListOf<String>()
@@ -183,10 +248,14 @@ class FreshCameraEngine(
         return "$logicalStr · $teleStr$c2Extra"
     }
 
+    /**
+     * Fix v16: HW Notte viene attivato SOLO nella modalità Notte (mai in Foto diurna!),
+     * evitando che l'algoritmo notturno introduca grana nelle foto luminose in interno.
+     */
     private fun pickDesiredExtensionMode(state: FreshCamState, extMgr: ExtensionsManager, targetSelector: CameraSelector): Pair<Int, String>? {
         if (state.shootingMode == ShootingMode.VIDEO) return null
         if (state.captureFormat != CaptureFormat.NORMAL) return null
-        if (!state.aiPreset.isEnabled) return null
+        if (!state.aiPreset.isEnabled && state.shootingMode == ShootingMode.PHOTO) return null
 
         val candidates: List<Pair<Int, String>> = when (state.shootingMode) {
             ShootingMode.NIGHT -> listOf(
@@ -199,22 +268,10 @@ class FreshCameraEngine(
                 ExtensionMode.HDR to "HW HDR",
                 ExtensionMode.AUTO to "HW Auto"
             )
-            else -> when (state.aiPreset.level) {
-                // Su ColorOS 1x espone Notte/Bokeh: su AI Alta usiamo HW Notte come multi-frame hardware!
-                3 -> listOf(
-                    ExtensionMode.HDR to "HW HDR",
-                    ExtensionMode.NIGHT to "HW Notte",
-                    ExtensionMode.AUTO to "HW Auto"
-                )
-                2 -> listOf(
-                    ExtensionMode.HDR to "HW HDR",
-                    ExtensionMode.AUTO to "HW Auto"
-                )
-                else -> listOf(
-                    ExtensionMode.AUTO to "HW Auto",
-                    ExtensionMode.HDR to "HW HDR"
-                )
-            }
+            else -> listOf(
+                ExtensionMode.HDR to "HW HDR",
+                ExtensionMode.AUTO to "HW Auto"
+            )
         }
 
         for (pair in candidates) {
@@ -273,8 +330,6 @@ class FreshCameraEngine(
         onBanner: (String) -> Unit
     ) {
         try {
-            // Se forceLogicalHwExtensions è attivo e stiamo tentando una HW Extension,
-            // proviamo sul selettore logico DEFAULT_BACK_CAMERA (dove ColorOS aggancia le estensioni!)
             val physicalSelector = selectorForLens(state.activeLens)
             val extCandidateSelector = if (state.activeLens != LensType.FRONT && state.forceLogicalHwExtensions) {
                 CameraSelector.DEFAULT_BACK_CAMERA
@@ -322,16 +377,16 @@ class FreshCameraEngine(
                 val pExt = Camera2Interop.Extender(previewBuilder)
                 val cExt = Camera2Interop.Extender(captureBuilder)
 
-                val isTele = state.activeLens == LensType.TELE_50MP
                 val nrMode = if (state.captureFormat == CaptureFormat.RAW) {
                     CaptureRequest.NOISE_REDUCTION_MODE_FAST
                 } else {
                     CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
                 }
-                val edgeMode = if (isTele) {
-                    CaptureRequest.EDGE_MODE_HIGH_QUALITY
-                } else {
+                // Fix v16: EDGE_MODE_HIGH_QUALITY attivo anche su Principale 1x (non solo Tele!)
+                val edgeMode = if (state.captureFormat == CaptureFormat.RAW) {
                     CaptureRequest.EDGE_MODE_FAST
+                } else {
+                    CaptureRequest.EDGE_MODE_HIGH_QUALITY
                 }
 
                 pExt.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, nrMode)
@@ -347,7 +402,8 @@ class FreshCameraEngine(
                 } else {
                     CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
                 }
-                val videoStabMode = if (state.stabilizationEnabled) {
+                // Fix v16: EIS video SOLO in modalità VIDEO (mai nelle foto -> niente crop/rumore video!)
+                val videoStabMode = if (state.stabilizationEnabled && state.shootingMode == ShootingMode.VIDEO) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
                     } else {
@@ -360,6 +416,7 @@ class FreshCameraEngine(
                 pExt.setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, oisMode)
                 cExt.setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, oisMode)
                 pExt.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, videoStabMode)
+                cExt.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
 
                 if (state.captureFormat == CaptureFormat.PRO) {
                     val expNs = 1_000_000_000L / state.shutterSpeedDenom.coerceAtLeast(1)
@@ -528,6 +585,22 @@ class FreshCameraEngine(
         return best
     }
 
+    private fun extractExifMap(jpegBytes: ByteArray): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        try {
+            val exif = ExifInterface(ByteArrayInputStream(jpegBytes))
+            for (tag in exifTagsToCopy) {
+                val value = exif.getAttribute(tag)
+                if (!value.isNullOrBlank()) {
+                    map[tag] = value
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("Reno14FreshCam", "Lettura EXIF parziale", e)
+        }
+        return map
+    }
+
     fun shootInstant(
         snapshot: FreshCamState,
         onStatus: (String) -> Unit,
@@ -541,20 +614,6 @@ class FreshCameraEngine(
         val capturedLocation = if (snapshot.locationTagEnabled) getLastKnownLocation() else null
         val isTele = snapshot.activeLens == LensType.TELE_50MP || snapshot.displayZoom >= 3.45f
 
-        // v15: Burst multi-frame ATTIVO GIA' DA 3.5x sulla Tele, e anche su 1x con AI Media/Alta se non c'è HW Extension
-        val needBurst = snapshot.activeHardwareExtension == null &&
-            snapshot.aiPreset.isEnabled &&
-            snapshot.captureFormat != CaptureFormat.RAW &&
-            (isTele || snapshot.aiPreset.level >= 2)
-
-        val burstCount = when {
-            !needBurst -> 1
-            snapshot.aiPreset.level >= 3 -> 4
-            else -> 3
-        }
-        val maxSide = if (snapshot.aiPreset.isEnabled && snapshot.activeHardwareExtension == null) 3400 else 4400
-        val collectedFrames = mutableListOf<Bitmap>()
-
         val requestedRatio = if (snapshot.activeHardwareExtension != null && snapshot.forceLogicalHwExtensions) {
             snapshot.displayZoom
         } else {
@@ -565,6 +624,29 @@ class FreshCameraEngine(
         } else {
             1.0f
         }
+
+        // Salvataggio JPEG DIRETTO senza ricompressione quando AI è Off (o HW Ext senza Cloud/filtri)
+        val isDirectPassthrough = (!snapshot.aiPreset.isEnabled || (snapshot.activeHardwareExtension != null && !snapshot.aiPreset.isCloud)) &&
+            snapshot.profile == CameraProfile.NATURAL &&
+            abs(snapshot.brightnessBoost) < 0.005f &&
+            !snapshot.postSavePolishEnabled &&
+            digitalExtraZoom <= 1.03f
+
+        val needBurst = !isDirectPassthrough &&
+            snapshot.activeHardwareExtension == null &&
+            snapshot.aiPreset.isEnabled &&
+            snapshot.captureFormat != CaptureFormat.RAW &&
+            (isTele || snapshot.aiPreset.level >= 2)
+
+        val burstCount = when {
+            !needBurst -> 1
+            snapshot.aiPreset.level >= 3 -> 4
+            else -> 3
+        }
+        // Piena risoluzione 12MP preservata sempre (niente più taglio a 3400px!)
+        val maxSide = 4400
+        val collectedFrames = mutableListOf<Bitmap>()
+        var capturedExifMap: Map<String, String> = emptyMap()
 
         if (snapshot.activeHardwareExtension != null) {
             onStatus("Scatto ${snapshot.activeHardwareExtension}...")
@@ -579,28 +661,77 @@ class FreshCameraEngine(
                     override fun onCaptureSuccess(imageProxy: ImageProxy) {
                         try {
                             val deg = imageProxy.imageInfo.rotationDegrees
-                            val rawBmp = proxyToBitmap(imageProxy)
-                            val rotated = rotate(rawBmp, deg)
-                            if (rotated !== rawBmp) rawBmp.recycle()
-                            val capped = capSize(rotated, maxSide)
-                            if (capped !== rotated) rotated.recycle()
-                            collectedFrames.add(capped)
+
+                            // Percorso VELOCE & SENZA PERDITA: JPEG diretto dal sensore con EXIF originali intatti!
+                            if (isDirectPassthrough && imageProxy.format == ImageFormat.JPEG) {
+                                val buf = imageProxy.planes[0].buffer
+                                val rawBytes = ByteArray(buf.remaining())
+                                buf.get(rawBytes)
+                                imageProxy.close()
+                                saveDirectJpegBytes(
+                                    jpegBytes = rawBytes,
+                                    rotationDegrees = deg,
+                                    snapshot = snapshot,
+                                    capturedLocation = capturedLocation,
+                                    onResult = onResult
+                                )
+                                return
+                            }
+
+                            val rawBytes = if (imageProxy.format == ImageFormat.JPEG) {
+                                val buf = imageProxy.planes[0].buffer
+                                val arr = ByteArray(buf.remaining())
+                                buf.get(arr)
+                                arr
+                            } else null
+
+                            if (rawBytes != null && capturedExifMap.isEmpty()) {
+                                capturedExifMap = extractExifMap(rawBytes)
+                            }
+
+                            val rawBmp = if (rawBytes != null) {
+                                BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size)
+                            } else {
+                                proxyToBitmap(imageProxy)
+                            }
+
+                            if (rawBmp != null) {
+                                val rotated = rotate(rawBmp, deg)
+                                if (rotated !== rawBmp) rawBmp.recycle()
+                                val capped = capSize(rotated, maxSide)
+                                if (capped !== rotated) rotated.recycle()
+                                collectedFrames.add(capped)
+                            }
                         } catch (t: Throwable) {
                             Log.e("Reno14FreshCam", "Errore acquisizione frame", t)
                         } finally {
-                            imageProxy.close()
+                            try { imageProxy.close() } catch (_: Throwable) {}
                         }
 
                         if (remaining > 1 && collectedFrames.isNotEmpty()) {
                             captureNextFrame(remaining - 1)
                         } else {
-                            processAndSaveFrames(collectedFrames, snapshot, digitalExtraZoom, capturedLocation, onResult)
+                            processAndSaveFrames(
+                                frames = collectedFrames,
+                                exifMap = capturedExifMap,
+                                snapshot = snapshot,
+                                digitalExtraZoom = digitalExtraZoom,
+                                capturedLocation = capturedLocation,
+                                onResult = onResult
+                            )
                         }
                     }
 
                     override fun onError(exception: ImageCaptureException) {
                         if (collectedFrames.isNotEmpty()) {
-                            processAndSaveFrames(collectedFrames, snapshot, digitalExtraZoom, capturedLocation, onResult)
+                            processAndSaveFrames(
+                                frames = collectedFrames,
+                                exifMap = capturedExifMap,
+                                snapshot = snapshot,
+                                digitalExtraZoom = digitalExtraZoom,
+                                capturedLocation = capturedLocation,
+                                onResult = onResult
+                            )
                         } else {
                             onResult(null, "Errore scatto: ${exception.message}")
                         }
@@ -612,8 +743,84 @@ class FreshCameraEngine(
         captureNextFrame(burstCount)
     }
 
+    private fun saveDirectJpegBytes(
+        jpegBytes: ByteArray,
+        rotationDegrees: Int,
+        snapshot: FreshCamState,
+        capturedLocation: Location?,
+        onResult: (uriString: String?, message: String) -> Unit
+    ) {
+        saveWorker.execute {
+            try {
+                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
+                val zoomTag = "${String.format(Locale.US, "%.1f", snapshot.displayZoom)}x"
+                val name = "FreshCam_${snapshot.profile.id}_${zoomTag}_$stamp.jpg"
+
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Reno14FreshCam")
+                    }
+                }
+
+                val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        out.write(jpegBytes)
+                    }
+
+                    // Verifica orientamento EXIF senza ricomprimere e aggiunge GPS se richiesto
+                    try {
+                        context.contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                            val exif = ExifInterface(pfd.fileDescriptor)
+                            var modified = false
+                            val currentOri = exif.getAttributeInt(
+                                ExifInterface.TAG_ORIENTATION,
+                                ExifInterface.ORIENTATION_UNDEFINED
+                            )
+                            if (rotationDegrees != 0 && (currentOri == ExifInterface.ORIENTATION_UNDEFINED || currentOri == ExifInterface.ORIENTATION_NORMAL)) {
+                                val targetOri = when (rotationDegrees) {
+                                    90 -> ExifInterface.ORIENTATION_ROTATE_90
+                                    180 -> ExifInterface.ORIENTATION_ROTATE_180
+                                    270 -> ExifInterface.ORIENTATION_ROTATE_270
+                                    else -> ExifInterface.ORIENTATION_NORMAL
+                                }
+                                exif.setAttribute(ExifInterface.TAG_ORIENTATION, targetOri.toString())
+                                modified = true
+                            }
+                            if (capturedLocation != null) {
+                                exif.setGpsInfo(capturedLocation)
+                                modified = true
+                            }
+                            if (modified) exif.saveAttributes()
+                        }
+                    } catch (e: Exception) {
+                        Log.w("Reno14FreshCam", "Aggiornamento EXIF diretto parziale", e)
+                    }
+
+                    val label = snapshot.activeHardwareExtension ?: "JPEG Diretto (EXIF Intatti)"
+                    val gpsNote = if (capturedLocation != null) " · GPS" else ""
+                    ContextCompat.getMainExecutor(context).execute {
+                        onResult(uri.toString(), "Salvata: $label$gpsNote")
+                    }
+                } else {
+                    ContextCompat.getMainExecutor(context).execute {
+                        onResult(null, "Errore salvataggio in Galleria")
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.e("Reno14FreshCam", "Errore salvataggio diretto JPEG", t)
+                ContextCompat.getMainExecutor(context).execute {
+                    onResult(null, "Errore foto: ${t.localizedMessage}")
+                }
+            }
+        }
+    }
+
     private fun processAndSaveFrames(
         frames: List<Bitmap>,
+        exifMap: Map<String, String>,
         snapshot: FreshCamState,
         digitalExtraZoom: Float,
         capturedLocation: Location?,
@@ -674,17 +881,28 @@ class FreshCameraEngine(
                     }
                     if (!outcome.bitmap.isRecycled) outcome.bitmap.recycle()
 
-                    if (capturedLocation != null) {
+                    // Ripristina tutti i metadati EXIF originali (ISO, Tempo, f/1.8, Focale) + GPS
+                    if (exifMap.isNotEmpty() || capturedLocation != null) {
                         try {
                             context.contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
                                 val exif = ExifInterface(pfd.fileDescriptor)
-                                exif.setGpsInfo(capturedLocation)
+                                for ((k, v) in exifMap) {
+                                    exif.setAttribute(k, v)
+                                }
+                                exif.setAttribute(
+                                    ExifInterface.TAG_ORIENTATION,
+                                    ExifInterface.ORIENTATION_NORMAL.toString()
+                                )
+                                if (capturedLocation != null) {
+                                    exif.setGpsInfo(capturedLocation)
+                                }
                                 exif.saveAttributes()
                             }
                         } catch (e: Exception) {
-                            Log.w("Reno14FreshCam", "Impossibile scrivere EXIF GPS", e)
+                            Log.w("Reno14FreshCam", "Impossibile scrivere EXIF", e)
                         }
                     }
+
                     val gpsNote = if (capturedLocation != null) " · GPS" else ""
                     ContextCompat.getMainExecutor(context).execute {
                         onResult(uri.toString(), "Salvata: ${outcome.modeApplied}$gpsNote")
@@ -762,12 +980,6 @@ class FreshCameraEngine(
     }
 
     private fun proxyToBitmap(image: ImageProxy): Bitmap {
-        if (image.format == ImageFormat.JPEG) {
-            val buf = image.planes[0].buffer
-            val arr = ByteArray(buf.remaining())
-            buf.get(arr)
-            return BitmapFactory.decodeByteArray(arr, 0, arr.size)
-        }
         val yBuf = image.planes[0].buffer
         val uBuf = image.planes[1].buffer
         val vBuf = image.planes[2].buffer

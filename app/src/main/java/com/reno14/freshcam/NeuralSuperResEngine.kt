@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
-import android.graphics.Rect
 import android.util.Base64
 import android.util.Log
 import org.json.JSONObject
@@ -13,11 +12,9 @@ import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.abs
-import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 data class NeuralProcessResult(
     val bitmap: Bitmap,
@@ -25,14 +22,12 @@ data class NeuralProcessResult(
 )
 
 /**
- * Motore Fotografico v15.0:
- * - Teleobiettivo 3.5x-120x (S5KJN5): Burst multi-frame 3-4 scatti ATTIVO GIA' DA 3.5x
- *   per colmare il divario di luce e definizione rispetto alla principale IMX882.
- * - Principale 1x: sfrutta HW Notte (unica estensione multi-frame reale esposta da ColorOS)
- *   oppure Burst multi-frame pulito su AI Media/Alta.
- * - Micro-contrasto a doppia scala pulito (senza il bug del 1/24 che lavava le ombre).
- * - Nuova Cloud AI: supporta Replicate Real-ESRGAN (ricostruzione generativa vera) con
- *   fusione completa o radiale e diagnostica chiara nel banner.
+ * Motore Fotografico v16.0:
+ * - Nessun taglio di risoluzione sui 12MP (pieno dettaglio 4096x3072 preservato).
+ * - Burst Multi-Frame con allineamento di precisione a 1 pixel (coarse-to-fine):
+ *   evita micro-sfocature sui dettagli fini rispetto al passo di 2px della v15.
+ * - Micro-contrasto a doppia scala pulito su sola luminanza (zero grana amplificata).
+ * - Cloud AI opzionale (Replicate Real-ESRGAN / Hugging Face).
  */
 class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Context) {
 
@@ -71,11 +66,6 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         val isTeleLens = activeLens == LensType.TELE_50MP || displayZoom >= 3.45f
 
         if (!aiPreset.isEnabled) {
-            if (isTeleLens) {
-                val teleOpt = applyDualScaleOpticalClarity(working, fineGain = 0.20f, medGain = 0.06f, noiseGate = 4.0f)
-                if (teleOpt !== working) working.recycle()
-                working = teleOpt
-            }
             if (postSavePolish) {
                 val toned = applySubtleFilmicCurve(working, strength = 0.22f)
                 if (toned !== working) working.recycle()
@@ -84,13 +74,13 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
             if (croppedFrames !== frames) croppedFrames.forEach { if (!it.isRecycled) it.recycle() }
             return NeuralProcessResult(
                 bitmap = working,
-                modeApplied = if (isTeleLens) "Tele Ottico (AI Off)" else "Ottica Pura (AI Off)"
+                modeApplied = if (isTeleLens) "Tele (AI Off)" else "Ottica Pura (AI Off)"
             )
         }
 
         val level = aiPreset.level
 
-        // 1. Burst Multi-Frame Anti-Ghosting: attivo sia su Tele (>= 3.5x) sia su 1x quando non c'è HW Extension
+        // 1. Burst Multi-Frame con allineamento a 1 pixel (coarse-to-fine)
         var burstUsed = false
         if (activeHardwareExtension == null && croppedFrames.size > 1) {
             try {
@@ -101,7 +91,7 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
                         profile.applyToBitmap(it, strength = profileIntensity, brightnessBoost = brightnessBoost)
                     }
                 }
-                val merged = alignAndMergeBurstFixed(working, gradedExtras)
+                val merged = alignAndMergeBurstPrecise(working, gradedExtras)
                 gradedExtras.forEach { if (!it.isRecycled) it.recycle() }
                 if (merged !== working) {
                     working.recycle()
@@ -114,27 +104,27 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         }
         if (croppedFrames !== frames) croppedFrames.forEach { if (!it.isRecycled) it.recycle() }
 
-        // 2. Chroma Denoise (pulisce rumore colore del sensore tele JN5 senza toccare la nitidezza)
+        // 2. Chroma Denoise (pulisce rumore colore lasciando intatta la luminanza)
         if (activeHardwareExtension == null && (isTeleLens || level >= 2)) {
             val cleanChroma = try { fastChromaDenoise(working) } catch (_: Throwable) { working }
             if (cleanChroma !== working && !working.isRecycled) working.recycle()
             working = cleanChroma
         }
 
-        // 3. Micro-Contrasto a Doppia Scala (tarato più deciso sul Tele 3.5x+ per superare la morbidezza dell'ottica f/2.8)
+        // 3. Micro-Contrasto a Doppia Scala (Noise-Gate più pulito per non evidenziare grana)
         if (activeHardwareExtension == null) {
-            val teleBonus = if (isTeleLens) 0.14f else 0.0f
+            val teleBonus = if (isTeleLens) 0.12f else 0.0f
             val fineGain = when (level) {
-                1 -> 0.22f + teleBonus
-                2 -> 0.34f + teleBonus
-                else -> 0.46f + teleBonus
+                1 -> 0.18f + teleBonus
+                2 -> 0.28f + teleBonus
+                else -> 0.38f + teleBonus
             }
             val medGain = when (level) {
-                1 -> if (isTeleLens) 0.10f else 0.06f
-                2 -> if (isTeleLens) 0.16f else 0.10f
-                else -> if (isTeleLens) 0.22f else 0.14f
+                1 -> if (isTeleLens) 0.08f else 0.05f
+                2 -> if (isTeleLens) 0.14f else 0.08f
+                else -> if (isTeleLens) 0.18f else 0.12f
             }
-            val noiseGate = if (displayZoom >= 10f) 4.5f else 3.2f
+            val noiseGate = if (displayZoom >= 10f) 5.0f else 4.2f
             val sharpened = try {
                 applyDualScaleOpticalClarity(working, fineGain = fineGain, medGain = medGain, noiseGate = noiseGate)
             } catch (_: Throwable) {
@@ -142,13 +132,9 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
             }
             if (sharpened !== working && !working.isRecycled) working.recycle()
             working = sharpened
-        } else if (level >= 3) {
-            val refined = applyDualScaleOpticalClarity(working, fineGain = 0.16f, medGain = 0.06f, noiseGate = 4.0f)
-            if (refined !== working) working.recycle()
-            working = refined
         }
 
-        // 4. Nuova Cloud AI Generativa (Replicate Real-ESRGAN o Hugging Face)
+        // 4. Cloud AI Generativa opzionale (Replicate Real-ESRGAN o Hugging Face)
         var cloudStatus = ""
         if (aiPreset.isCloud) {
             val cloudAlpha = when (level) {
@@ -179,7 +165,7 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         }
 
         if (postSavePolish) {
-            val toned = try { applySubtleFilmicCurve(working, strength = 0.24f) } catch (_: Throwable) { working }
+            val toned = try { applySubtleFilmicCurve(working, strength = 0.22f) } catch (_: Throwable) { working }
             if (toned !== working && !working.isRecycled) working.recycle()
             working = toned
         }
@@ -198,11 +184,6 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         )
     }
 
-    /**
-     * Doppia scala pulita su sola luminanza:
-     * - Scala fine (3x3 Laplacian): incide micro-dettagli con Noise-Gate.
-     * - Scala media (1/4): aggiunge micro-contrasto locale (Clarity) senza aloni né ombre lavate.
-     */
     private fun applyDualScaleOpticalClarity(
         source: Bitmap,
         fineGain: Float,
@@ -250,12 +231,12 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
                     0f
                 } else {
                     val sign = if (fineD >= 0f) 1f else -1f
-                    sign * (absFine - noiseGate).coerceAtMost(22f)
+                    sign * (absFine - noiseGate).coerceAtMost(20f)
                 }
 
                 val mc = medPx[idx]
                 val yMed = 0.299f * ((mc ushr 16) and 0xFF) + 0.587f * ((mc ushr 8) and 0xFF) + 0.114f * (mc and 0xFF)
-                val medD = (yC - yMed).coerceIn(-18f, 18f)
+                val medD = (yC - yMed).coerceIn(-16f, 16f)
 
                 val haloGuard = when {
                     yC > 224f -> ((255f - yC) / 31f).coerceIn(0.15f, 1.0f)
@@ -285,11 +266,6 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         return out
     }
 
-    /**
-     * Replicate Real-ESRGAN API (sincrono con `Prefer: wait=30`):
-     * Invia l'intera foto ridimensionata a 1024px (per restare veloce), ottiene la ricostruzione
-     * generativa completa x2 da Real-ESRGAN e la fonde in modo pulito sull'originale.
-     */
     private fun tryReplicateRealEsrgan(
         source: Bitmap,
         endpointUrl: String,
@@ -339,7 +315,6 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
             var outUrl = obj.optString("output", "")
             val getUrl = obj.optJSONObject("urls")?.optString("get", "") ?: ""
 
-            // Se non è finito nei 30s di wait, fa polling veloce fino a 15s
             var attempts = 0
             while (outUrl.isBlank() && getUrl.isNotBlank() && attempts < 8) {
                 Thread.sleep(2000)
@@ -448,9 +423,14 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         }
     }
 
-    private fun alignAndMergeBurstFixed(base: Bitmap, extras: List<Bitmap>): Bitmap {
+    /**
+     * Burst Multi-Frame v16 con allineamento di precisione a 1 pixel (Coarse -> Fine):
+     * Riduce drasticamente la micro-sfocatura rispetto al passo 2px della v15.
+     */
+    private fun alignAndMergeBurstPrecise(base: Bitmap, extras: List<Bitmap>): Bitmap {
         val w = base.width
         val h = base.height
+        if (w < 64 || h < 64) return base
         val total = w * h
         val basePx = IntArray(total)
         base.getPixels(basePx, 0, w, 0, 0, w, h)
@@ -460,11 +440,33 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         val accB = IntArray(total) { (basePx[it] and 0xFF) * 2 }
         val accW = ByteArray(total) { 2 }
 
-        val patchSize = min(120, min(w, h) / 3)
-        val cx = w / 2 - patchSize / 2
-        val cy = h / 2 - patchSize / 2
+        val margin = 12
+        val patchSize = min(140, min(w, h) / 3).coerceAtMost(min(w, h) - margin * 2 - 4)
+        if (patchSize < 24) return base
+        val cx = (w - patchSize) / 2
+        val cy = (h - patchSize) / 2
         val extPx = IntArray(total)
         var mergedAny = false
+
+        fun computeSad(dx: Int, dy: Int, step: Int): Pair<Long, Int> {
+            var sad = 0L
+            var cnt = 0
+            var py = 0
+            while (py < patchSize) {
+                val rowBase = (cy + py) * w
+                val rowExt = (cy + py + dy) * w
+                var px = 0
+                while (px < patchSize) {
+                    val bVal = basePx[rowBase + cx + px]
+                    val eVal = extPx[rowExt + cx + px + dx]
+                    sad += abs(((bVal ushr 8) and 0xFF) - ((eVal ushr 8) and 0xFF))
+                    cnt++
+                    px += step
+                }
+                py += step
+            }
+            return sad to cnt
+        }
 
         for (extra in extras) {
             if (extra.width != w || extra.height != h) continue
@@ -475,20 +477,10 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
             var bestSad = Long.MAX_VALUE
             var samples = 0
 
+            // Fase 1: Ricerca grossolana (step 2)
             for (dy in -8..8 step 2) {
                 for (dx in -8..8 step 2) {
-                    var sad = 0L
-                    var cnt = 0
-                    for (py in 0 until patchSize step 4) {
-                        val rowBase = (cy + py) * w
-                        val rowExt = (cy + py + dy) * w
-                        for (px in 0 until patchSize step 4) {
-                            val bVal = basePx[rowBase + cx + px]
-                            val eVal = extPx[rowExt + cx + px + dx]
-                            sad += abs(((bVal ushr 8) and 0xFF) - ((eVal ushr 8) and 0xFF))
-                            cnt++
-                        }
-                    }
+                    val (sad, cnt) = computeSad(dx, dy, 4)
                     if (sad < bestSad) {
                         bestSad = sad
                         bestDx = dx
@@ -498,13 +490,30 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
                 }
             }
 
-            if (samples == 0 || (bestSad / samples) > 15) continue
+            // Fase 2: Rifinitura fine a 1 pixel attorno al miglior spostamento
+            val coarseDx = bestDx
+            val coarseDy = bestDy
+            bestSad = Long.MAX_VALUE
+            for (dy in (coarseDy - 1)..(coarseDy + 1)) {
+                for (dx in (coarseDx - 1)..(coarseDx + 1)) {
+                    if (abs(dx) > 10 || abs(dy) > 10) continue
+                    val (sad, cnt) = computeSad(dx, dy, 3)
+                    if (sad < bestSad) {
+                        bestSad = sad
+                        bestDx = dx
+                        bestDy = dy
+                        samples = cnt
+                    }
+                }
+            }
+
+            if (samples == 0 || (bestSad / samples) > 14) continue
             mergedAny = true
 
-            for (y in 8 until h - 8) {
+            for (y in margin until h - margin) {
                 val rowB = y * w
                 val rowE = (y + bestDy) * w
-                for (x in 8 until w - 8) {
+                for (x in margin until w - margin) {
                     val idxB = rowB + x
                     val idxE = rowE + (x + bestDx)
                     val bp = basePx[idxB]
@@ -518,7 +527,7 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
                     val eg = (ep ushr 8) and 0xFF
                     val eb = ep and 0xFF
 
-                    if ((abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3 < 15) {
+                    if ((abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3 < 13) {
                         accR[idxB] += er
                         accG[idxB] += eg
                         accB[idxB] += eb

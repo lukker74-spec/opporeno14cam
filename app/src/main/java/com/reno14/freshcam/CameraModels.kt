@@ -7,6 +7,9 @@ import android.graphics.Paint
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorMatrix
 
+val PRO_ISO_STOPS = listOf(50, 100, 160, 200, 320, 400, 640, 800, 1250, 1600, 3200)
+val PRO_SHUTTER_DENOMS = listOf(4, 8, 15, 25, 30, 50, 60, 100, 125, 250, 500, 1000, 2000)
+
 enum class CameraProfile(
     val id: String,
     val displayName: String,
@@ -75,10 +78,10 @@ enum class UnifiedAiPreset(
     val isCloud: Boolean,
     val level: Int
 ) {
-    OFF("AI Off", "AI Disattivata", false, false, 0),
-    LOCAL_LOW("AI Bassa", "Locale · Bassa (Burst 3x)", true, false, 1),
-    LOCAL_MED("AI Media", "Locale · Media (Burst + Micro-Dettaglio)", true, false, 2),
-    LOCAL_HIGH("AI Alta", "HW Notte / Locale Alta (Burst 4x)", true, false, 3),
+    OFF("AI Off", "AI Disattivata (JPEG Diretto)", false, false, 0),
+    LOCAL_LOW("AI Bassa", "Locale · Bassa (Pulita)", true, false, 1),
+    LOCAL_MED("AI Media", "Locale · Media (Burst 3x Preciso)", true, false, 2),
+    LOCAL_HIGH("AI Alta", "Locale · Alta (Burst 4x + Dettaglio)", true, false, 3),
     CLOUD_LOW("Cloud Bassa", "Cloud Generativa · Bassa", true, true, 1),
     CLOUD_MED("Cloud Media", "Cloud Generativa · Media", true, true, 2),
     CLOUD_HIGH("Cloud Alta", "Cloud Generativa · Alta", true, true, 3)
@@ -157,7 +160,7 @@ data class PhysicalLensInfo(
 data class FreshCamState(
     val profile: CameraProfile = CameraProfile.NATURAL,
     val captureFormat: CaptureFormat = CaptureFormat.NORMAL,
-    val aiPreset: UnifiedAiPreset = UnifiedAiPreset.LOCAL_MED,
+    val aiPreset: UnifiedAiPreset = UnifiedAiPreset.OFF,
     val cloudModelPreset: CloudModelPreset = CloudModelPreset.REPLICATE_REALESRGAN,
     val timerMode: TimerMode = TimerMode.OFF,
     val countdownRemaining: Int = 0,
@@ -168,6 +171,7 @@ data class FreshCamState(
     val forceLogicalHwExtensions: Boolean = true,
     val activeHardwareExtension: String? = null,
     val hwExtensionsReport: String = "Scansione estensioni HW...",
+    val sensorCapabilitiesReport: String = "Scansione sensori 50MP / RAW...",
     val focusMode: FocusMode = FocusMode.AI_LOCK,
     val isSubjectLocked: Boolean = false,
     val manualFocusDistance: Float = 0.5f,
@@ -179,8 +183,8 @@ data class FreshCamState(
     val brightnessBoost: Float = 0.0f,
     val evCompensation: Int = 0,
     val profileIntensity: Float = 1.0f,
-    val isoValue: Int = 160,
-    val shutterSpeedDenom: Int = 125,
+    val isoValue: Int = 400,
+    val shutterSpeedDenom: Int = 60,
     val stabilizationEnabled: Boolean = true,
     val cloudApiKey: String = "",
     val cloudEndpointUrl: String = CloudModelPreset.REPLICATE_REALESRGAN.url,

@@ -1,5 +1,7 @@
-# Reno14 FreshCam v15.0 (Tentativo Sblocco HW Extensions + Burst Tele da 3.5x + Replicate Real-ESRGAN)
+# Reno14 FreshCam v16.0 (JPEG Diretto + EXIF Completi + Burst 1px + Scansione Sensori)
 
-- **Tentativo Sblocco Estensioni HW:** nuova opzione *Forza Camera Logica per Estensioni HW* (attiva di default) che aggancia `DEFAULT_BACK_CAMERA` invece dell'ID fisico della tele, più scansione profonda Camera2 `CameraExtensionCharacteristics` su tutti gli ID posteriori.
-- **Teleobiettivo 3.5x–120x potenziato:** Burst multi-frame 3–4 scatti attivo già da `3.5x` + micro-contrasto a doppia scala tarato per il sensore `S5KJN5`.
-- **Nuova Cloud AI:** integrato **Replicate Real-ESRGAN** (ricostruzione generativa vera) selezionabile nelle Impostazioni.
+- **Formato di default 100% JPEG leggero:** nessun file DNG/RAW pesante salvato in Galleria.
+- **JPEG diretto senza ricompressione su AI Off:** salva i byte originali del sensore con tutti gli EXIF nativi (ISO, tempo, f/1.8, focale).
+- **EXIF completi anche con AI e Profili attivi:** i metadati di scatto vengono sempre copiati sul file salvato.
+- **Fix qualità su 1x e Tele:** `EDGE_MODE_HIGH_QUALITY` attivo anche su `1x`, EIS confinato ai soli video (solo OIS in foto), `HW Notte` confinato alla sola modalità Notte, pieno dettaglio 12MP senza tagli a 3400px e Burst con allineamento di precisione a 1 pixel.
+- **Scansione sensori 50MP / RAW (sola lettura):** nuova riga azzurra nelle Impostazioni per sapere cosa espone ColorOS su `1x` e `Tele`.

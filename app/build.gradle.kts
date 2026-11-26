@@ -12,8 +12,8 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 21
-        versionName = "15.0.0-hw-unlock-burst"
+        versionCode = 22
+        versionName = "16.0.0-direct-jpeg-exif"
     }
 
     buildTypes {
