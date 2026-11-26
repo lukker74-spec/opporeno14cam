@@ -1,2 +1,3 @@
 -keep class androidx.camera.** { *; }
 -keep class androidx.exifinterface.** { *; }
+-keep class ai.onnxruntime.** { *; }

@@ -1,7 +1,9 @@
-# Reno14 FreshCam v16.0 (JPEG Diretto + EXIF Completi + Burst 1px + Scansione Sensori)
+# Reno14 FreshCam v18.0 (Vera AI Neurale Locale ONNX + NPU NNAPI + RAW-in-RAM → JPEG)
 
-- **Formato di default 100% JPEG leggero:** nessun file DNG/RAW pesante salvato in Galleria.
-- **JPEG diretto senza ricompressione su AI Off:** salva i byte originali del sensore con tutti gli EXIF nativi (ISO, tempo, f/1.8, focale).
-- **EXIF completi anche con AI e Profili attivi:** i metadati di scatto vengono sempre copiati sul file salvato.
-- **Fix qualità su 1x e Tele:** `EDGE_MODE_HIGH_QUALITY` attivo anche su `1x`, EIS confinato ai soli video (solo OIS in foto), `HW Notte` confinato alla sola modalità Notte, pieno dettaglio 12MP senza tagli a 3400px e Burst con allineamento di precisione a 1 pixel.
-- **Scansione sensori 50MP / RAW (sola lettura):** nuova riga azzurra nelle Impostazioni per sapere cosa espone ColorOS su `1x` e `Tele`.
+- **Vera AI Generativa / Super-Resolution 100% Locale Offline (`OnnxGenerativeEngine.kt`):**
+  - Integra `onnxruntime-android:1.24.2` con due veri modelli neurali scaricati automaticamente in fase di build:
+    1. **`4x-ClearRealityV1.onnx` (SPAN 4x, 1.7 MB, predefinito):** veloce e fotorealistico, pulisce la grana e ricostruisce texture naturali.
+    2. **`realesr-general-x4v3.onnx` (Real-ESRGAN v3 4x, 4.9 MB):** ricostruzione più spinta per zoom estremi (20x–120x).
+  - Prova l'accelerazione **Android NNAPI FP16** (per delegare alla NPU/DSP Dimensity quando supportata) con fallback automatico e trasparente a **CPU ARM 4-Thread**, mostrando backend e tempo reale nel banner di salvataggio.
+- **Zero Cloud a pagamento:** Replicate rimosso completamente; resta solo l'opzione gratuita opzionale (Hugging Face con token gratuito `hf_...` o endpoint gratuito personalizzato) con avviso esplicito se non configurata.
+- **Fix banner con `AI Lock`:** il blocco fuoco non nasconde più i messaggi di salvataggio, tempi AI o errori.

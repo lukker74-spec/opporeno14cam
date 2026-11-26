@@ -5,9 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
-import android.util.Base64
 import android.util.Log
-import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -18,18 +16,21 @@ import kotlin.math.sin
 
 data class NeuralProcessResult(
     val bitmap: Bitmap,
-    val modeApplied: String
+    val modeApplied: String,
+    val backendUsed: String? = null
 )
 
 /**
- * Motore Fotografico v16.0:
- * - Nessun taglio di risoluzione sui 12MP (pieno dettaglio 4096x3072 preservato).
- * - Burst Multi-Frame con allineamento di precisione a 1 pixel (coarse-to-fine):
- *   evita micro-sfocature sui dettagli fini rispetto al passo di 2px della v15.
- * - Micro-contrasto a doppia scala pulito su sola luminanza (zero grana amplificata).
- * - Cloud AI opzionale (Replicate Real-ESRGAN / Hugging Face).
+ * Motore Fotografico v18.0:
+ * - Vera AI Generativa Locale tramite OnnxGenerativeEngine (ClearReality SPAN 4x / Real-ESRGAN v3 4x).
+ * - Multi-Frame ombra-pulito come base quando RAW-in-RAM è spento.
+ * - Solo Cloud Gratuito opzionale (Hugging Face gratis con token hf_... o URL personalizzato gratuito).
+ *   Rimossa del tutto la parte Cloud a pagamento.
  */
-class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Context) {
+class NeuralSuperResEngine(
+    @Suppress("UNUSED_PARAMETER") private val context: Context,
+    private val onnxEngine: OnnxGenerativeEngine
+) {
 
     fun processBurst(
         frames: List<Bitmap>,
@@ -37,17 +38,18 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         profileIntensity: Float,
         brightnessBoost: Float,
         aiPreset: UnifiedAiPreset,
+        localNeuralModel: LocalNeuralModel,
+        preferNnapiNpu: Boolean,
         activeHardwareExtension: String?,
         activeLens: LensType,
         displayZoom: Float,
         digitalExtraZoom: Float,
-        cloudModelPreset: CloudModelPreset,
         cloudEndpointUrl: String,
         cloudApiKey: String,
         postSavePolish: Boolean
     ): NeuralProcessResult {
         val croppedFrames = if (digitalExtraZoom > 1.03f) {
-            frames.map { applyDigitalCrop(it, digitalExtraZoom) }
+            frames.map { cropOpticalCenter(it, digitalExtraZoom, keepNativeSize = aiPreset.isEnabled && !aiPreset.isCloud) }
         } else {
             frames
         }
@@ -79,9 +81,9 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         }
 
         val level = aiPreset.level
-
-        // 1. Burst Multi-Frame con allineamento a 1 pixel (coarse-to-fine)
         var burstUsed = false
+
+        // 1. Fusione Multi-Frame di base prima della rete neurale (abbatte il rumore casuale)
         if (activeHardwareExtension == null && croppedFrames.size > 1) {
             try {
                 val gradedExtras = croppedFrames.drop(1).map {
@@ -91,7 +93,7 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
                         profile.applyToBitmap(it, strength = profileIntensity, brightnessBoost = brightnessBoost)
                     }
                 }
-                val merged = alignAndMergeBurstPrecise(working, gradedExtras)
+                val merged = alignAndMergeBurstShadowClean(working, gradedExtras)
                 gradedExtras.forEach { if (!it.isRecycled) it.recycle() }
                 if (merged !== working) {
                     working.recycle()
@@ -104,64 +106,42 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         }
         if (croppedFrames !== frames) croppedFrames.forEach { if (!it.isRecycled) it.recycle() }
 
-        // 2. Chroma Denoise (pulisce rumore colore lasciando intatta la luminanza)
-        if (activeHardwareExtension == null && (isTeleLens || level >= 2)) {
-            val cleanChroma = try { fastChromaDenoise(working) } catch (_: Throwable) { working }
-            if (cleanChroma !== working && !working.isRecycled) working.recycle()
-            working = cleanChroma
-        }
+        val parts = mutableListOf<String>()
+        if (activeHardwareExtension != null) parts.add(activeHardwareExtension)
+        if (burstUsed) parts.add("Burst ${frames.size}x")
+        var usedBackend: String? = null
 
-        // 3. Micro-Contrasto a Doppia Scala (Noise-Gate più pulito per non evidenziare grana)
-        if (activeHardwareExtension == null) {
-            val teleBonus = if (isTeleLens) 0.12f else 0.0f
-            val fineGain = when (level) {
-                1 -> 0.18f + teleBonus
-                2 -> 0.28f + teleBonus
-                else -> 0.38f + teleBonus
-            }
-            val medGain = when (level) {
-                1 -> if (isTeleLens) 0.08f else 0.05f
-                2 -> if (isTeleLens) 0.14f else 0.08f
-                else -> if (isTeleLens) 0.18f else 0.12f
-            }
-            val noiseGate = if (displayZoom >= 10f) 5.0f else 4.2f
-            val sharpened = try {
-                applyDualScaleOpticalClarity(working, fineGain = fineGain, medGain = medGain, noiseGate = noiseGate)
-            } catch (_: Throwable) {
-                working
-            }
-            if (sharpened !== working && !working.isRecycled) working.recycle()
-            working = sharpened
-        }
-
-        // 4. Cloud AI Generativa opzionale (Replicate Real-ESRGAN o Hugging Face)
-        var cloudStatus = ""
-        if (aiPreset.isCloud) {
-            val cloudAlpha = when (level) {
-                1 -> 0.55f
-                2 -> 0.80f
-                else -> 1.0f
-            }
-            val (cloudBmp, statusMsg) = if (cloudModelPreset.isReplicate || cloudEndpointUrl.contains("replicate.com")) {
-                tryReplicateRealEsrgan(
-                    source = working,
-                    endpointUrl = cloudEndpointUrl,
-                    apiKey = cloudApiKey,
-                    blendStrength = cloudAlpha
-                )
+        // 2. VERA AI GENERATIVA LOCALE OFFLINE (ONNX Runtime: ClearReality SPAN 4x o Real-ESRGAN v3 4x)
+        if (!aiPreset.isCloud) {
+            val aiOutcome = onnxEngine.enhancePhoto(
+                source = working,
+                model = localNeuralModel,
+                level = level,
+                displayZoom = displayZoom,
+                preferNnapi = preferNnapiNpu
+            )
+            usedBackend = aiOutcome.backendUsed
+            if (aiOutcome.error != null) {
+                parts.add("AI ERR: ${aiOutcome.error}")
             } else {
-                tryHuggingFaceSuperRes(
-                    source = working,
-                    endpointUrl = cloudEndpointUrl,
-                    apiKey = cloudApiKey,
-                    blendStrength = cloudAlpha
-                )
+                if (aiOutcome.bitmap !== working && !working.isRecycled) working.recycle()
+                working = aiOutcome.bitmap
+                parts.add(aiOutcome.label)
             }
-            cloudStatus = statusMsg
+        } else {
+            // 3. CLOUD GRATUITO OPZIONALE (Hugging Face Free Token o Endpoint Gratuito personalizzato)
+            val cloudAlpha = if (level >= 3) 1.0f else 0.78f
+            val (cloudBmp, statusMsg) = tryFreeCloudSuperRes(
+                source = working,
+                endpointUrl = cloudEndpointUrl,
+                apiKey = cloudApiKey,
+                blendStrength = cloudAlpha
+            )
             if (cloudBmp != null) {
-                if (cloudBmp !== working) working.recycle()
+                if (cloudBmp !== working && !working.isRecycled) working.recycle()
                 working = cloudBmp
             }
+            parts.add(statusMsg)
         }
 
         if (postSavePolish) {
@@ -170,221 +150,49 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
             working = toned
         }
 
-        val parts = mutableListOf<String>()
-        if (activeHardwareExtension != null) parts.add(activeHardwareExtension)
-        if (burstUsed) parts.add("Burst ${frames.size}x")
-        if (activeHardwareExtension == null) {
-            parts.add(if (isTeleLens) "Tele ${aiPreset.shortBadge}" else aiPreset.shortBadge)
-        }
-        if (cloudStatus.isNotEmpty()) parts.add(cloudStatus)
-
         return NeuralProcessResult(
             bitmap = working,
-            modeApplied = parts.joinToString(" · ")
+            modeApplied = parts.joinToString(" · "),
+            backendUsed = usedBackend
         )
     }
 
-    private fun applyDualScaleOpticalClarity(
+    fun applyFreeCloudToBitmap(
         source: Bitmap,
-        fineGain: Float,
-        medGain: Float,
-        noiseGate: Float
-    ): Bitmap {
-        val w = source.width
-        val h = source.height
-        val src = IntArray(w * h)
-        val dst = IntArray(w * h)
-        source.getPixels(src, 0, w, 0, 0, w, h)
-
-        val medSmall = Bitmap.createScaledBitmap(source, max(2, w / 4), max(2, h / 4), true)
-        val medBlur = Bitmap.createScaledBitmap(medSmall, w, h, true)
-        medSmall.recycle()
-        val medPx = IntArray(w * h)
-        medBlur.getPixels(medPx, 0, w, 0, 0, w, h)
-        medBlur.recycle()
-
-        for (y in 1 until h - 1) {
-            val row = y * w
-            for (x in 1 until w - 1) {
-                val idx = row + x
-                val c = src[idx]
-                val r = (c ushr 16) and 0xFF
-                val g = (c ushr 8) and 0xFF
-                val b = c and 0xFF
-                val yC = 0.299f * r + 0.587f * g + 0.114f * b
-
-                val n = src[idx - w]
-                val s = src[idx + w]
-                val e = src[idx + 1]
-                val west = src[idx - 1]
-
-                val yN = 0.299f * ((n ushr 16) and 0xFF) + 0.587f * ((n ushr 8) and 0xFF) + 0.114f * (n and 0xFF)
-                val yS = 0.299f * ((s ushr 16) and 0xFF) + 0.587f * ((s ushr 8) and 0xFF) + 0.114f * (s and 0xFF)
-                val yE = 0.299f * ((e ushr 16) and 0xFF) + 0.587f * ((e ushr 8) and 0xFF) + 0.114f * (e and 0xFF)
-                val yW = 0.299f * ((west ushr 16) and 0xFF) + 0.587f * ((west ushr 8) and 0xFF) + 0.114f * (west and 0xFF)
-
-                val yAvg = (yN + yS + yE + yW) * 0.25f
-                val fineD = yC - yAvg
-                val absFine = abs(fineD)
-
-                val gatedFine = if (absFine <= noiseGate) {
-                    0f
-                } else {
-                    val sign = if (fineD >= 0f) 1f else -1f
-                    sign * (absFine - noiseGate).coerceAtMost(20f)
-                }
-
-                val mc = medPx[idx]
-                val yMed = 0.299f * ((mc ushr 16) and 0xFF) + 0.587f * ((mc ushr 8) and 0xFF) + 0.114f * (mc and 0xFF)
-                val medD = (yC - yMed).coerceIn(-16f, 16f)
-
-                val haloGuard = when {
-                    yC > 224f -> ((255f - yC) / 31f).coerceIn(0.15f, 1.0f)
-                    yC < 16f -> (yC / 16f).coerceIn(0.20f, 1.0f)
-                    else -> 1.0f
-                }
-
-                val delta = (gatedFine * fineGain + medD * medGain) * haloGuard
-                val nr = (r + delta).toInt().coerceIn(0, 255)
-                val ng = (g + delta).toInt().coerceIn(0, 255)
-                val nb = (b + delta).toInt().coerceIn(0, 255)
-                dst[idx] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
-            }
+        level: Int,
+        cloudEndpointUrl: String,
+        cloudApiKey: String
+    ): Pair<Bitmap, String> {
+        val cloudAlpha = if (level >= 3) 1.0f else 0.78f
+        val (cloudBmp, statusMsg) = tryFreeCloudSuperRes(source, cloudEndpointUrl, cloudApiKey, cloudAlpha)
+        return if (cloudBmp != null) {
+            if (cloudBmp !== source && !source.isRecycled) source.recycle()
+            cloudBmp to statusMsg
+        } else {
+            source to statusMsg
         }
-
-        for (x in 0 until w) {
-            dst[x] = src[x]
-            dst[(h - 1) * w + x] = src[(h - 1) * w + x]
-        }
-        for (y in 0 until h) {
-            dst[y * w] = src[y * w]
-            dst[y * w + (w - 1)] = src[y * w + (w - 1)]
-        }
-
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(dst, 0, w, 0, 0, w, h)
-        return out
     }
 
-    private fun tryReplicateRealEsrgan(
+    private fun tryFreeCloudSuperRes(
         source: Bitmap,
         endpointUrl: String,
         apiKey: String,
         blendStrength: Float
     ): Pair<Bitmap?, String> {
-        if (apiKey.isBlank()) return null to "Cloud: inserisci Token Replicate"
-        return try {
-            val uploadBmp = scaleToMaxSide(source, 1024)
-            val baos = ByteArrayOutputStream()
-            uploadBmp.compress(Bitmap.CompressFormat.JPEG, 92, baos)
-            if (uploadBmp !== source) uploadBmp.recycle()
-            val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-
-            val inputObj = JSONObject().apply {
-                put("image", "data:image/jpeg;base64,$b64")
-                put("scale", 2)
-                put("face_enhance", false)
-            }
-            val bodyJson = JSONObject().apply {
-                put("input", inputObj)
-            }.toString()
-
-            val conn = (URL(endpointUrl).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 10000
-                readTimeout = 40000
-                doOutput = true
-                setRequestProperty("Authorization", "Bearer ${apiKey.trim()}")
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("Prefer", "wait=30")
-            }
-
-            conn.outputStream.use { it.write(bodyJson.toByteArray(Charsets.UTF_8)) }
-            val code = conn.responseCode
-            if (code !in 200..299) {
-                val hint = when (code) {
-                    401, 403 -> "Token Replicate non valido"
-                    402 -> "Credito Replicate esaurito"
-                    else -> "Replicate HTTP $code"
-                }
-                return null to "Cloud: $hint"
-            }
-
-            val respStr = conn.inputStream.use { String(it.readBytes(), Charsets.UTF_8) }
-            val obj = JSONObject(respStr)
-            var outUrl = obj.optString("output", "")
-            val getUrl = obj.optJSONObject("urls")?.optString("get", "") ?: ""
-
-            var attempts = 0
-            while (outUrl.isBlank() && getUrl.isNotBlank() && attempts < 8) {
-                Thread.sleep(2000)
-                attempts++
-                val pollConn = (URL(getUrl).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = 8000
-                    readTimeout = 10000
-                    setRequestProperty("Authorization", "Bearer ${apiKey.trim()}")
-                }
-                if (pollConn.responseCode in 200..299) {
-                    val pObj = JSONObject(pollConn.inputStream.use { String(it.readBytes(), Charsets.UTF_8) })
-                    val status = pObj.optString("status")
-                    if (status == "succeeded") {
-                        outUrl = pObj.optString("output", "")
-                        break
-                    } else if (status == "failed" || status == "canceled") {
-                        return null to "Cloud: elaborazione fallita"
-                    }
-                }
-            }
-
-            if (outUrl.isBlank()) return null to "Cloud: timeout Replicate"
-
-            val imgConn = (URL(outUrl).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 10000
-                readTimeout = 20000
-            }
-            val imgBytes = imgConn.inputStream.use { it.readBytes() }
-            val srBmp = BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.size)
-                ?: return null to "Cloud: decodifica fallita"
-
-            val out = if (blendStrength >= 0.95f) {
-                srBmp
-            } else {
-                val scaledSr = Bitmap.createScaledBitmap(srBmp, source.width, source.height, true)
-                srBmp.recycle()
-                val blended = source.copy(Bitmap.Config.ARGB_8888, true)
-                val canvas = Canvas(blended)
-                val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-                    alpha = (blendStrength * 255).toInt().coerceIn(80, 255)
-                }
-                canvas.drawBitmap(scaledSr, 0f, 0f, paint)
-                scaledSr.recycle()
-                blended
-            }
-            out to "Cloud Real-ESRGAN OK"
-        } catch (e: Throwable) {
-            Log.w("PhotoEngine", "Errore Replicate Cloud: ${e.message}")
-            null to "Cloud: errore rete"
+        if (endpointUrl.isBlank()) return null to "Cloud Gratis: URL mancante nelle Impostazioni"
+        if (endpointUrl.contains("huggingface.co") && apiKey.isBlank()) {
+            return null to "Cloud Gratis: inserisci Token gratuito HF (hf_...)"
         }
-    }
-
-    private fun tryHuggingFaceSuperRes(
-        source: Bitmap,
-        endpointUrl: String,
-        apiKey: String,
-        blendStrength: Float
-    ): Pair<Bitmap?, String> {
-        if (endpointUrl.isBlank()) return null to "Cloud: URL mancante"
         return try {
             val uploadBmp = scaleToMaxSide(source, 768)
             val baos = ByteArrayOutputStream()
             uploadBmp.compress(Bitmap.CompressFormat.JPEG, 92, baos)
             if (uploadBmp !== source) uploadBmp.recycle()
 
-            val conn = (URL(endpointUrl).openConnection() as HttpURLConnection).apply {
+            val conn = (URL(endpointUrl.trim()).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
-                connectTimeout = 8000
-                readTimeout = 25000
+                connectTimeout = 10000
+                readTimeout = 30000
                 doOutput = true
                 setRequestProperty("Content-Type", "image/jpeg")
                 setRequestProperty("Accept", "image/png, image/jpeg, application/json")
@@ -398,36 +206,39 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
             if (code in 200..299) {
                 val respBytes = conn.inputStream.use { it.readBytes() }
                 val srBmp = BitmapFactory.decodeByteArray(respBytes, 0, respBytes.size)
-                    ?: return null to "Cloud: risposta non valida"
-                val scaledSr = Bitmap.createScaledBitmap(srBmp, source.width, source.height, true)
+                    ?: return null to "Cloud Gratis: risposta non immagine"
+                val targetW = max(source.width, srBmp.width).coerceAtMost(4096)
+                val targetH = max(source.height, srBmp.height).coerceAtMost(3072)
+                val scaledSr = Bitmap.createScaledBitmap(srBmp, targetW, targetH, true)
                 srBmp.recycle()
-                val blended = source.copy(Bitmap.Config.ARGB_8888, true)
-                val canvas = Canvas(blended)
-                val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-                    alpha = (blendStrength * 255).toInt().coerceIn(80, 255)
+                if (blendStrength >= 0.95f) {
+                    scaledSr to "Cloud Gratis OK"
+                } else {
+                    val base = Bitmap.createScaledBitmap(source, targetW, targetH, true)
+                    val canvas = Canvas(base)
+                    val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+                        alpha = (blendStrength * 255).toInt().coerceIn(80, 255)
+                    }
+                    canvas.drawBitmap(scaledSr, 0f, 0f, paint)
+                    scaledSr.recycle()
+                    base to "Cloud Gratis OK"
                 }
-                canvas.drawBitmap(scaledSr, 0f, 0f, paint)
-                scaledSr.recycle()
-                blended to "Cloud HF OK"
             } else {
                 val errHint = when (code) {
-                    401, 403 -> "Token HF richiesto"
-                    404 -> "Modello non trovato"
-                    503 -> "Modello in avvio"
+                    401, 403 -> "Token HF non valido"
+                    402 -> "Quota gratuita HF esaurita"
+                    404 -> "Endpoint non trovato"
+                    503 -> "Server HF in avvio (riprova)"
                     else -> "HTTP $code"
                 }
-                null to "Cloud: $errHint"
+                null to "Cloud Gratis: $errHint"
             }
         } catch (e: Throwable) {
-            null to "Cloud: timeout/rete"
+            null to "Cloud Gratis: errore rete/timeout"
         }
     }
 
-    /**
-     * Burst Multi-Frame v16 con allineamento di precisione a 1 pixel (Coarse -> Fine):
-     * Riduce drasticamente la micro-sfocatura rispetto al passo 2px della v15.
-     */
-    private fun alignAndMergeBurstPrecise(base: Bitmap, extras: List<Bitmap>): Bitmap {
+    private fun alignAndMergeBurstShadowClean(base: Bitmap, extras: List<Bitmap>): Bitmap {
         val w = base.width
         val h = base.height
         if (w < 64 || h < 64) return base
@@ -435,10 +246,23 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         val basePx = IntArray(total)
         base.getPixels(basePx, 0, w, 0, 0, w, h)
 
-        val accR = IntArray(total) { ((basePx[it] ushr 16) and 0xFF) * 2 }
-        val accG = IntArray(total) { ((basePx[it] ushr 8) and 0xFF) * 2 }
-        val accB = IntArray(total) { (basePx[it] and 0xFF) * 2 }
-        val accW = ByteArray(total) { 2 }
+        val accR = IntArray(total)
+        val accG = IntArray(total)
+        val accB = IntArray(total)
+        val accW = ByteArray(total)
+
+        for (i in 0 until total) {
+            val c = basePx[i]
+            val r = (c ushr 16) and 0xFF
+            val g = (c ushr 8) and 0xFF
+            val b = c and 0xFF
+            val yC = (77 * r + 150 * g + 29 * b) shr 8
+            val initW = if (yC < 95) 1 else 2
+            accR[i] = r * initW
+            accG[i] = g * initW
+            accB[i] = b * initW
+            accW[i] = initW.toByte()
+        }
 
         val margin = 12
         val patchSize = min(140, min(w, h) / 3).coerceAtMost(min(w, h) - margin * 2 - 4)
@@ -477,7 +301,6 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
             var bestSad = Long.MAX_VALUE
             var samples = 0
 
-            // Fase 1: Ricerca grossolana (step 2)
             for (dy in -8..8 step 2) {
                 for (dx in -8..8 step 2) {
                     val (sad, cnt) = computeSad(dx, dy, 4)
@@ -490,7 +313,6 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
                 }
             }
 
-            // Fase 2: Rifinitura fine a 1 pixel attorno al miglior spostamento
             val coarseDx = bestDx
             val coarseDy = bestDy
             bestSad = Long.MAX_VALUE
@@ -507,7 +329,7 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
                 }
             }
 
-            if (samples == 0 || (bestSad / samples) > 14) continue
+            if (samples == 0 || (bestSad / samples) > 15) continue
             mergedAny = true
 
             for (y in margin until h - margin) {
@@ -527,7 +349,9 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
                     val eg = (ep ushr 8) and 0xFF
                     val eb = ep and 0xFF
 
-                    if ((abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3 < 13) {
+                    val yB = (77 * br + 150 * bg + 29 * bb) shr 8
+                    val diffLimit = if (yB < 95) 18 else 13
+                    if ((abs(br - er) + abs(bg - eg) + abs(bb - eb)) / 3 < diffLimit) {
                         accR[idxB] += er
                         accG[idxB] += eg
                         accB[idxB] += eb
@@ -552,67 +376,14 @@ class NeuralSuperResEngine(@Suppress("UNUSED_PARAMETER") private val context: Co
         return out
     }
 
-    private fun fastChromaDenoise(bitmap: Bitmap): Bitmap {
-        val w = bitmap.width
-        val h = bitmap.height
-        val src = IntArray(w * h)
-        val dst = IntArray(w * h)
-        bitmap.getPixels(src, 0, w, 0, 0, w, h)
-
-        for (y in 1 until h - 1) {
-            val row = y * w
-            for (x in 1 until w - 1) {
-                val idx = row + x
-                val c = src[idx]
-                val r = (c ushr 16) and 0xFF
-                val g = (c ushr 8) and 0xFF
-                val b = c and 0xFF
-                val yC = (77 * r + 150 * g + 29 * b) shr 8
-
-                var sumU = (b - yC) * 2
-                var sumV = (r - yC) * 2
-                var cnt = 2
-
-                val neighbors = intArrayOf(src[idx - w], src[idx + w], src[idx - 1], src[idx + 1])
-                for (n in neighbors) {
-                    val nr = (n ushr 16) and 0xFF
-                    val ng = (n ushr 8) and 0xFF
-                    val nb = n and 0xFF
-                    val yN = (77 * nr + 150 * ng + 29 * nb) shr 8
-                    if (abs(yC - yN) < 22) {
-                        sumU += (nb - yN)
-                        sumV += (nr - yN)
-                        cnt++
-                    }
-                }
-
-                val outR = (yC + sumV / cnt).coerceIn(0, 255)
-                val outB = (yC + sumU / cnt).coerceIn(0, 255)
-                val outG = ((yC * 256 - 77 * outR - 29 * outB) / 150).coerceIn(0, 255)
-                dst[idx] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
-            }
-        }
-        for (x in 0 until w) {
-            dst[x] = src[x]
-            dst[(h - 1) * w + x] = src[(h - 1) * w + x]
-        }
-        for (y in 0 until h) {
-            dst[y * w] = src[y * w]
-            dst[y * w + (w - 1)] = src[y * w + (w - 1)]
-        }
-
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(dst, 0, w, 0, 0, w, h)
-        return out
-    }
-
-    private fun applyDigitalCrop(bmp: Bitmap, factor: Float): Bitmap {
+    private fun cropOpticalCenter(bmp: Bitmap, factor: Float, keepNativeSize: Boolean): Bitmap {
         val f = factor.coerceIn(1.0f, 4.0f)
-        val newW = (bmp.width / f).toInt().coerceAtLeast(256)
-        val newH = (bmp.height / f).toInt().coerceAtLeast(256)
+        val newW = (bmp.width / f).toInt().coerceAtLeast(160)
+        val newH = (bmp.height / f).toInt().coerceAtLeast(160)
         val sx = (bmp.width - newW) / 2
         val sy = (bmp.height - newH) / 2
         val crop = Bitmap.createBitmap(bmp, sx, sy, newW, newH)
+        if (keepNativeSize) return crop
         val upscaled = Bitmap.createScaledBitmap(crop, bmp.width, bmp.height, true)
         crop.recycle()
         return upscaled

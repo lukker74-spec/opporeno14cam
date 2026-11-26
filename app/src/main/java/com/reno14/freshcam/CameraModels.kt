@@ -71,6 +71,26 @@ enum class CameraProfile(
     }
 }
 
+enum class LocalNeuralModel(
+    val shortName: String,
+    val displayName: String,
+    val assetPath: String,
+    val description: String
+) {
+    CLEAR_REALITY_SPAN(
+        shortName = "SPAN",
+        displayName = "ClearReality SPAN 4x (Consigliato · Veloce & Fotorealistico)",
+        assetPath = "models/4x-ClearRealityV1.onnx",
+        description = "Rete neurale SPAN moderna (1.7 MB): pulisce grana e ombre con texture naturali e alta velocità su mobile."
+    ),
+    REAL_ESRGAN_V3(
+        shortName = "ESRGAN",
+        displayName = "Real-ESRGAN v3 4x (Ricostruzione Spinta · Zoom Estremi)",
+        assetPath = "models/realesr-general-x4v3.onnx",
+        description = "Rete GAN compatta (4.9 MB): ricostruzione bordi più incisiva, ottima su zoom 20x-120x."
+    )
+}
+
 enum class UnifiedAiPreset(
     val shortBadge: String,
     val fullLabel: String,
@@ -78,30 +98,22 @@ enum class UnifiedAiPreset(
     val isCloud: Boolean,
     val level: Int
 ) {
-    OFF("AI Off", "AI Disattivata (JPEG Diretto)", false, false, 0),
-    LOCAL_LOW("AI Bassa", "Locale · Bassa (Pulita)", true, false, 1),
-    LOCAL_MED("AI Media", "Locale · Media (Burst 3x Preciso)", true, false, 2),
-    LOCAL_HIGH("AI Alta", "Locale · Alta (Burst 4x + Dettaglio)", true, false, 3),
-    CLOUD_LOW("Cloud Bassa", "Cloud Generativa · Bassa", true, true, 1),
-    CLOUD_MED("Cloud Media", "Cloud Generativa · Media", true, true, 2),
-    CLOUD_HIGH("Cloud Alta", "Cloud Generativa · Alta", true, true, 3)
+    OFF("AI Off", "AI Neurale Spenta (Solo Ottica / RAW)", false, false, 0),
+    LOCAL_LOW("AI Bassa", "AI Neurale Locale · Bassa (Naturale)", true, false, 1),
+    LOCAL_MED("AI Media", "AI Neurale Locale · Media (Bilanciata)", true, false, 2),
+    LOCAL_HIGH("AI Alta", "AI Neurale Locale · Alta (Massima Ricostruzione)", true, false, 3),
+    CLOUD_FREE_MED("Cloud Gratis", "Cloud Gratis HF · Media", true, true, 2),
+    CLOUD_FREE_HIGH("Cloud Max", "Cloud Gratis HF · Alta", true, true, 3)
 }
 
-enum class CloudModelPreset(val label: String, val url: String, val isReplicate: Boolean) {
-    REPLICATE_REALESRGAN(
-        "Replicate Real-ESRGAN (Consigliato · Ricostruzione Vera)",
-        "https://api.replicate.com/v1/models/nightmareai/real-esrgan/predictions",
-        true
+enum class FreeCloudPreset(val label: String, val url: String) {
+    HF_SWIN2SR_FREE(
+        "Hugging Face Gratis (Router Swin2SR · Token hf_...)",
+        "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr"
     ),
-    HF_REAL_ESRGAN(
-        "Hugging Face Swin2SR RealWorld x4",
-        "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
-        false
-    ),
-    CUSTOM(
-        "Endpoint Personalizzato",
-        "",
-        false
+    CUSTOM_FREE(
+        "URL Personalizzato (es. tuo Space ZeroGPU / Server gratuito)",
+        ""
     )
 }
 
@@ -160,12 +172,21 @@ data class PhysicalLensInfo(
 data class FreshCamState(
     val profile: CameraProfile = CameraProfile.NATURAL,
     val captureFormat: CaptureFormat = CaptureFormat.NORMAL,
-    val aiPreset: UnifiedAiPreset = UnifiedAiPreset.OFF,
-    val cloudModelPreset: CloudModelPreset = CloudModelPreset.REPLICATE_REALESRGAN,
+    val aiPreset: UnifiedAiPreset = UnifiedAiPreset.LOCAL_MED,
+    val localNeuralModel: LocalNeuralModel = LocalNeuralModel.CLEAR_REALITY_SPAN,
+    val preferNnapiNpu: Boolean = true,
+    val localAiBackendStatus: String = "In attesa di inizializzazione ONNX...",
+    val rawInRamEnabled: Boolean = true,
+    val backgroundProcessingEnabled: Boolean = true,
+    val backgroundJobsCount: Int = 0,
+    val freeCloudPreset: FreeCloudPreset = FreeCloudPreset.HF_SWIN2SR_FREE,
+    val cloudApiKey: String = "",
+    val cloudEndpointUrl: String = FreeCloudPreset.HF_SWIN2SR_FREE.url,
+    val showCloudSetupDialog: Boolean = false,
     val timerMode: TimerMode = TimerMode.OFF,
     val countdownRemaining: Int = 0,
     val videoResolution: VideoResolution = VideoResolution.UHD_4K,
-    val jpegQuality: Int = 98,
+    val jpegQuality: Int = 97,
     val activeLens: LensType = LensType.MAIN_50MP,
     val detectedLenses: List<PhysicalLensInfo> = emptyList(),
     val forceLogicalHwExtensions: Boolean = true,
@@ -186,8 +207,6 @@ data class FreshCamState(
     val isoValue: Int = 400,
     val shutterSpeedDenom: Int = 60,
     val stabilizationEnabled: Boolean = true,
-    val cloudApiKey: String = "",
-    val cloudEndpointUrl: String = CloudModelPreset.REPLICATE_REALESRGAN.url,
     val postSavePolishEnabled: Boolean = false,
     val gridEnabled: Boolean = true,
     val locationTagEnabled: Boolean = false,

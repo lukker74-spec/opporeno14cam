@@ -12,8 +12,12 @@ android {
         applicationId = "com.reno14.freshcam"
         minSdk = 29
         targetSdk = 35
-        versionCode = 22
-        versionName = "16.0.0-direct-jpeg-exif"
+        versionCode = 24
+        versionName = "18.0.0-true-local-ai"
+    }
+
+    androidResources {
+        noCompress += "onnx"
     }
 
     buildTypes {
@@ -50,6 +54,9 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
+
+    // Vero motore neurale locale ONNX Runtime Android (con supporto NNAPI NPU/DSP + CPU multi-thread)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.24.2")
 
     val cameraxVersion = "1.4.1"
     implementation("androidx.camera:camera-core:$cameraxVersion")
