@@ -621,9 +621,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 title = { Text("Cloud Gratuito non configurato", fontWeight = FontWeight.Bold) },
                 text = {
                     Text(
-                        "Per usare il Cloud gratuito devi inserire il tuo token gratuito Hugging Face (hf_..., nessuna carta richiesta) oppure un URL di un tuo endpoint gratuito nelle Impostazioni.
-
-In alternativa puoi usare la nuova AI Neurale Locale ONNX (100% offline e gratuita, già attiva!)."
+                        "Per usare il Cloud gratuito devi inserire il tuo token gratuito Hugging Face (hf_..., nessuna carta richiesta) oppure un URL di un tuo endpoint gratuito nelle Impostazioni.\n\nIn alternativa puoi usare la nuova AI Neurale Locale ONNX (100% offline e gratuita, già attiva!)."
                     )
                 },
                 confirmButton = {
