@@ -1,4 +1,4 @@
-name: Build Reno14 FreshCam v16 DirectJpegExif APK
+name: Build Reno14 FreshCam v18 TrueLocalAI APK
 
 on:
   push:
@@ -34,6 +34,31 @@ jobs:
           rm -f app/src/main/java/com/reno14/freshcam/GenerativeSuperResEngine.kt
           rm -f app/src/main/assets/superres.tflite
 
+      - name: Download Real ONNX Generative AI Models
+        working-directory: ${{ steps.find_dir.outputs.dir }}
+        run: |
+          mkdir -p app/src/main/assets/models
+          echo "Downloading 4x-ClearRealityV1.onnx (SPAN Photorealistic, ~1.7MB)..."
+          curl -fSL --retry 3 --retry-delay 2 \
+            "https://huggingface.co/huggingworld/onnx-image-models/resolve/main/4x-ClearRealityV1.onnx" \
+            -o app/src/main/assets/models/4x-ClearRealityV1.onnx
+
+          echo "Downloading realesr-general-x4v3.onnx (Real-ESRGAN v3, ~4.9MB)..."
+          curl -fSL --retry 3 --retry-delay 2 \
+            "https://huggingface.co/momoapps/optimix-models/resolve/main/realesr-general-x4v3.onnx" \
+            -o app/src/main/assets/models/realesr-general-x4v3.onnx || \
+          curl -fSL --retry 3 --retry-delay 2 \
+            "https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/realesr-general-x4v3.onnx" \
+            -o app/src/main/assets/models/realesr-general-x4v3.onnx
+
+          ls -lh app/src/main/assets/models/
+          SPAN_SIZE=$(stat -c%s app/src/main/assets/models/4x-ClearRealityV1.onnx)
+          ESR_SIZE=$(stat -c%s app/src/main/assets/models/realesr-general-x4v3.onnx)
+          if [ "$SPAN_SIZE" -lt 500000 ] || [ "$ESR_SIZE" -lt 1000000 ]; then
+            echo "ERRORE: Modelli ONNX scaricati non validi (dimensione troppo piccola)."
+            exit 1
+          fi
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -52,5 +77,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reno14-FreshCam-v16-DirectJpegExif-APK
+          name: Reno14-FreshCam-v18-TrueLocalAI-APK
           path: ${{ steps.find_dir.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
