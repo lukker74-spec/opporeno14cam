@@ -1,4 +1,4 @@
-name: Build Reno14 FreshCam v13 StablePro APK
+name: Build Reno14 FreshCam v15 HwUnlock+BurstTele APK
 
 on:
   push:
@@ -12,7 +12,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Find Gradle project directory
+        id: find_dir
+        run: |
+          if [ -f "settings.gradle.kts" ]; then
+            echo "dir=." >> $GITHUB_OUTPUT
+          elif [ -f "Reno14-FreshCam/settings.gradle.kts" ]; then
+            echo "dir=Reno14-FreshCam" >> $GITHUB_OUTPUT
+          else
+            FOUND=$(find . -maxdepth 3 -name "settings.gradle.kts" | head -n 1)
+            if [ -z "$FOUND" ]; then
+              echo "ERRORE: settings.gradle.kts non trovato."
+              exit 1
+            fi
+            echo "dir=$(dirname "$FOUND")" >> $GITHUB_OUTPUT
+          fi
+
       - name: Clean legacy files
+        working-directory: ${{ steps.find_dir.outputs.dir }}
         run: |
           rm -f app/src/main/java/com/reno14/freshcam/GenerativeSuperResEngine.kt
           rm -f app/src/main/assets/superres.tflite
@@ -29,10 +46,11 @@ jobs:
           gradle-version: '8.9'
 
       - name: Build Debug APK
+        working-directory: ${{ steps.find_dir.outputs.dir }}
         run: gradle assembleDebug
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reno14-FreshCam-v13-StablePro-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: Reno14-FreshCam-v15-HwUnlock-APK
+          path: ${{ steps.find_dir.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
