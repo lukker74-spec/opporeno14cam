@@ -1,4 +1,4 @@
-name: Build Reno14 FreshCam v15 HwUnlock+BurstTele APK
+name: Build Reno14 FreshCam v16 DirectJpegExif APK
 
 on:
   push:
@@ -52,5 +52,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reno14-FreshCam-v15-HwUnlock-APK
+          name: Reno14-FreshCam-v16-DirectJpegExif-APK
           path: ${{ steps.find_dir.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
