@@ -12,6 +12,7 @@ import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraExtensionCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.location.Location
@@ -32,6 +33,8 @@ import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.extensions.ExtensionMode
+import androidx.camera.extensions.ExtensionsManager
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.MediaStoreOutputOptions
@@ -58,6 +61,7 @@ class FreshCameraEngine(
     private val lifecycleOwner: LifecycleOwner
 ) {
     private var cameraProvider: ProcessCameraProvider? = null
+    private var extensionsManager: ExtensionsManager? = null
     private var imageCapture: ImageCapture? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
@@ -129,11 +133,107 @@ class FreshCameraEngine(
         return CameraSelector.DEFAULT_BACK_CAMERA
     }
 
+    /**
+     * Scansione profonda v15: verifica sia CameraX Extensions su DEFAULT_BACK_CAMERA (logica)
+     * sia le Camera2 CameraExtensionCharacteristics (Android 12+) su ogni ID fisico!
+     */
+    private fun buildDeepExtensionsReport(extMgr: ExtensionsManager): String {
+        fun probeCx(label: String, sel: CameraSelector): String {
+            val found = mutableListOf<String>()
+            if (extMgr.isExtensionAvailable(sel, ExtensionMode.HDR)) found.add("HDR")
+            if (extMgr.isExtensionAvailable(sel, ExtensionMode.NIGHT)) found.add("Notte")
+            if (extMgr.isExtensionAvailable(sel, ExtensionMode.AUTO)) found.add("Auto")
+            if (extMgr.isExtensionAvailable(sel, ExtensionMode.BOKEH)) found.add("Bokeh")
+            return "$label: " + if (found.isEmpty()) "Nessuna" else found.joinToString("/")
+        }
+
+        val logicalStr = probeCx("Logica", CameraSelector.DEFAULT_BACK_CAMERA)
+        val teleStr = probeCx("Tele", selectorForLens(LensType.TELE_50MP))
+
+        var c2Extra = ""
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                val mgr = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                val c2Found = mutableListOf<String>()
+                for (id in mgr.cameraIdList) {
+                    val chars = mgr.getCameraCharacteristics(id)
+                    if (chars.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) continue
+                    val extChars = mgr.getCameraExtensionCharacteristics(id)
+                    val modes = extChars.supportedExtensions
+                    if (modes.isNotEmpty()) {
+                        val names = modes.map { m ->
+                            when (m) {
+                                CameraExtensionCharacteristics.EXTENSION_AUTOMATIC -> "Auto"
+                                CameraExtensionCharacteristics.EXTENSION_HDR -> "HDR"
+                                CameraExtensionCharacteristics.EXTENSION_NIGHT -> "Notte"
+                                CameraExtensionCharacteristics.EXTENSION_BOKEH -> "Bokeh"
+                                CameraExtensionCharacteristics.EXTENSION_FACE_RETOUCH -> "Face"
+                                else -> "#$m"
+                            }
+                        }
+                        c2Found.add("ID$id[${names.joinToString(",")}]")
+                    }
+                }
+                if (c2Found.isNotEmpty()) {
+                    c2Extra = " | C2: ${c2Found.joinToString(" ")}"
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        return "$logicalStr · $teleStr$c2Extra"
+    }
+
+    private fun pickDesiredExtensionMode(state: FreshCamState, extMgr: ExtensionsManager, targetSelector: CameraSelector): Pair<Int, String>? {
+        if (state.shootingMode == ShootingMode.VIDEO) return null
+        if (state.captureFormat != CaptureFormat.NORMAL) return null
+        if (!state.aiPreset.isEnabled) return null
+
+        val candidates: List<Pair<Int, String>> = when (state.shootingMode) {
+            ShootingMode.NIGHT -> listOf(
+                ExtensionMode.NIGHT to "HW Notte",
+                ExtensionMode.HDR to "HW HDR",
+                ExtensionMode.AUTO to "HW Auto"
+            )
+            ShootingMode.PORTRAIT -> listOf(
+                ExtensionMode.BOKEH to "HW Bokeh",
+                ExtensionMode.HDR to "HW HDR",
+                ExtensionMode.AUTO to "HW Auto"
+            )
+            else -> when (state.aiPreset.level) {
+                // Su ColorOS 1x espone Notte/Bokeh: su AI Alta usiamo HW Notte come multi-frame hardware!
+                3 -> listOf(
+                    ExtensionMode.HDR to "HW HDR",
+                    ExtensionMode.NIGHT to "HW Notte",
+                    ExtensionMode.AUTO to "HW Auto"
+                )
+                2 -> listOf(
+                    ExtensionMode.HDR to "HW HDR",
+                    ExtensionMode.AUTO to "HW Auto"
+                )
+                else -> listOf(
+                    ExtensionMode.AUTO to "HW Auto",
+                    ExtensionMode.HDR to "HW HDR"
+                )
+            }
+        }
+
+        for (pair in candidates) {
+            try {
+                if (extMgr.isExtensionAvailable(targetSelector, pair.first)) {
+                    return pair
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
     @SuppressLint("RestrictedApi", "UnsafeOptInUsageError")
     fun bind(
         previewView: PreviewView,
         state: FreshCamState,
         onZoomBounds: (minZ: Float, maxZ: Float) -> Unit,
+        onExtensionUpdate: (activeExt: String?, report: String) -> Unit,
         onBanner: (String) -> Unit
     ) {
         if (discoveredLenses.isEmpty()) discoverLenses()
@@ -144,6 +244,71 @@ class FreshCameraEngine(
                 val provider = future.get()
                 cameraProvider = provider
 
+                val extMgr = extensionsManager
+                if (extMgr == null) {
+                    val extFuture = ExtensionsManager.getInstanceAsync(context, provider)
+                    extFuture.addListener({
+                        val mgr = try { extFuture.get() } catch (_: Throwable) { null }
+                        extensionsManager = mgr
+                        bindInternal(provider, mgr, previewView, state, onZoomBounds, onExtensionUpdate, onBanner)
+                    }, ContextCompat.getMainExecutor(context))
+                } else {
+                    bindInternal(provider, extMgr, previewView, state, onZoomBounds, onExtensionUpdate, onBanner)
+                }
+            } catch (e: Exception) {
+                Log.e("Reno14FreshCam", "Errore inizializzazione CameraProvider", e)
+                onBanner("Attivazione ${state.activeLens.label}")
+            }
+        }, ContextCompat.getMainExecutor(context))
+    }
+
+    @SuppressLint("RestrictedApi", "UnsafeOptInUsageError")
+    private fun bindInternal(
+        provider: ProcessCameraProvider,
+        extMgr: ExtensionsManager?,
+        previewView: PreviewView,
+        state: FreshCamState,
+        onZoomBounds: (minZ: Float, maxZ: Float) -> Unit,
+        onExtensionUpdate: (activeExt: String?, report: String) -> Unit,
+        onBanner: (String) -> Unit
+    ) {
+        try {
+            // Se forceLogicalHwExtensions è attivo e stiamo tentando una HW Extension,
+            // proviamo sul selettore logico DEFAULT_BACK_CAMERA (dove ColorOS aggancia le estensioni!)
+            val physicalSelector = selectorForLens(state.activeLens)
+            val extCandidateSelector = if (state.activeLens != LensType.FRONT && state.forceLogicalHwExtensions) {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            } else {
+                physicalSelector
+            }
+
+            val report = if (extMgr != null) buildDeepExtensionsReport(extMgr) else "Estensioni HW non rilevate"
+            val desiredExt = if (extMgr != null) pickDesiredExtensionMode(state, extMgr, extCandidateSelector) else null
+            var activeExtLabel: String? = null
+            var bound: Camera? = null
+
+            if (extMgr != null && desiredExt != null) {
+                try {
+                    val extSelector = extMgr.getExtensionEnabledCameraSelector(extCandidateSelector, desiredExt.first)
+                    val previewExt = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+                    val capExtBuilder = ImageCapture.Builder()
+                        .setJpegQuality(state.jpegQuality.coerceIn(85, 100))
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                    applyFlashBuilder(capExtBuilder, state.flashMode)
+                    val capExt = capExtBuilder.build()
+
+                    provider.unbindAll()
+                    bound = provider.bindToLifecycle(lifecycleOwner, extSelector, previewExt, capExt)
+                    imageCapture = capExt
+                    activeExtLabel = desiredExt.second
+                } catch (e: Throwable) {
+                    Log.w("Reno14FreshCam", "Estensione HW ${desiredExt.second} rifiutata: ${e.message}")
+                    activeExtLabel = null
+                    bound = null
+                }
+            }
+
+            if (bound == null) {
                 val previewBuilder = Preview.Builder()
                 val resSelector = ResolutionSelector.Builder()
                     .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
@@ -224,12 +389,7 @@ class FreshCameraEngine(
                     }
                 }
 
-                when (state.flashMode) {
-                    FlashMode.OFF -> captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_OFF)
-                    FlashMode.AUTO -> captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_AUTO)
-                    FlashMode.ON -> captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_ON)
-                    FlashMode.TORCH -> captureBuilder.setFlashMode(ImageCapture.FLASH_MODE_OFF)
-                }
+                applyFlashBuilder(captureBuilder, state.flashMode)
 
                 val preview = previewBuilder.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
                 imageCapture = captureBuilder.build()
@@ -252,42 +412,55 @@ class FreshCameraEngine(
                 videoCapture = vBuilder.build()
 
                 provider.unbindAll()
-                val bound = if (state.shootingMode == ShootingMode.VIDEO) {
-                    provider.bindToLifecycle(lifecycleOwner, selectorForLens(state.activeLens), preview, videoCapture)
+                bound = if (state.shootingMode == ShootingMode.VIDEO) {
+                    provider.bindToLifecycle(lifecycleOwner, physicalSelector, preview, videoCapture)
                 } else {
-                    provider.bindToLifecycle(lifecycleOwner, selectorForLens(state.activeLens), preview, imageCapture)
+                    provider.bindToLifecycle(lifecycleOwner, physicalSelector, preview, imageCapture)
                 }
-                camera = bound
+            }
 
-                bound.cameraControl.enableTorch(state.flashMode == FlashMode.TORCH)
+            camera = bound
+            onExtensionUpdate(activeExtLabel, report)
 
-                if (state.captureFormat != CaptureFormat.PRO) {
-                    applyExposureCompensation(state.evCompensation)
-                }
+            bound.cameraControl.enableTorch(state.flashMode == FlashMode.TORCH)
 
+            if (state.captureFormat != CaptureFormat.PRO) {
+                applyExposureCompensation(state.evCompensation)
+            }
+
+            try {
                 val chars = Camera2CameraInfo.extractCameraCharacteristics(bound.cameraInfo)
                 minFocusDistanceDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
-
-                bound.cameraInfo.zoomState.value?.let { zs ->
-                    currentMaxHwZoomRatio = zs.maxZoomRatio
-                    onZoomBounds(zs.minZoomRatio, zs.maxZoomRatio)
-                    val targetRatio = if (state.activeLens == LensType.MAIN_50MP && state.displayZoom <= 1.05f) {
-                        1.0f.coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
-                    } else {
-                        state.lensZoomRatio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
-                    }
-                    bound.cameraControl.setZoomRatio(targetRatio)
-                }
-            } catch (e: Exception) {
-                Log.e("Reno14FreshCam", "Errore avvio fotocamera", e)
-                onBanner("Attivazione ${state.activeLens.label}")
+            } catch (_: Throwable) {
             }
-        }, ContextCompat.getMainExecutor(context))
+
+            bound.cameraInfo.zoomState.value?.let { zs ->
+                currentMaxHwZoomRatio = zs.maxZoomRatio
+                onZoomBounds(zs.minZoomRatio, zs.maxZoomRatio)
+                val targetRatio = if (activeExtLabel != null && state.forceLogicalHwExtensions) {
+                    state.displayZoom.coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
+                } else if (state.activeLens == LensType.MAIN_50MP && state.displayZoom <= 1.05f) {
+                    1.0f.coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
+                } else {
+                    state.lensZoomRatio.coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
+                }
+                bound.cameraControl.setZoomRatio(targetRatio)
+            }
+        } catch (e: Exception) {
+            Log.e("Reno14FreshCam", "Errore avvio fotocamera", e)
+            onBanner("Attivazione ${state.activeLens.label}")
+        }
     }
 
-    /**
-     * Aggiorna EV e Flash/Torcia dinamicamente SENZA riavviare la fotocamera (previene i blocchi!)
-     */
+    private fun applyFlashBuilder(builder: ImageCapture.Builder, flashMode: FlashMode) {
+        when (flashMode) {
+            FlashMode.OFF -> builder.setFlashMode(ImageCapture.FLASH_MODE_OFF)
+            FlashMode.AUTO -> builder.setFlashMode(ImageCapture.FLASH_MODE_AUTO)
+            FlashMode.ON -> builder.setFlashMode(ImageCapture.FLASH_MODE_ON)
+            FlashMode.TORCH -> builder.setFlashMode(ImageCapture.FLASH_MODE_OFF)
+        }
+    }
+
     fun applyExposureCompensation(ev: Int) {
         val cam = camera ?: return
         val range = cam.cameraInfo.exposureState.exposureCompensationRange
@@ -366,21 +539,37 @@ class FreshCameraEngine(
         }
 
         val capturedLocation = if (snapshot.locationTagEnabled) getLastKnownLocation() else null
-        val isTeleSpinto = snapshot.displayZoom >= 10.0f
-        val needBurst = snapshot.aiPreset.isEnabled && snapshot.captureFormat != CaptureFormat.RAW && isTeleSpinto
-        val burstCount = if (needBurst) 3 else 1
-        // 3200px max side mantiene alta nitidezza riducendo del 60% il picco RAM (zero blocchi!)
-        val maxSide = if (snapshot.aiPreset.isEnabled) 3200 else 4200
+        val isTele = snapshot.activeLens == LensType.TELE_50MP || snapshot.displayZoom >= 3.45f
+
+        // v15: Burst multi-frame ATTIVO GIA' DA 3.5x sulla Tele, e anche su 1x con AI Media/Alta se non c'è HW Extension
+        val needBurst = snapshot.activeHardwareExtension == null &&
+            snapshot.aiPreset.isEnabled &&
+            snapshot.captureFormat != CaptureFormat.RAW &&
+            (isTele || snapshot.aiPreset.level >= 2)
+
+        val burstCount = when {
+            !needBurst -> 1
+            snapshot.aiPreset.level >= 3 -> 4
+            else -> 3
+        }
+        val maxSide = if (snapshot.aiPreset.isEnabled && snapshot.activeHardwareExtension == null) 3400 else 4400
         val collectedFrames = mutableListOf<Bitmap>()
 
-        val digitalExtraZoom = if (snapshot.activeLens == LensType.TELE_50MP && snapshot.lensZoomRatio > currentMaxHwZoomRatio) {
-            (snapshot.lensZoomRatio / currentMaxHwZoomRatio).coerceIn(1.0f, 4.0f)
+        val requestedRatio = if (snapshot.activeHardwareExtension != null && snapshot.forceLogicalHwExtensions) {
+            snapshot.displayZoom
+        } else {
+            snapshot.lensZoomRatio
+        }
+        val digitalExtraZoom = if (requestedRatio > currentMaxHwZoomRatio && snapshot.displayZoom >= 3.45f) {
+            (requestedRatio / currentMaxHwZoomRatio).coerceIn(1.0f, 4.0f)
         } else {
             1.0f
         }
 
-        if (snapshot.aiPreset.isEnabled) {
-            onStatus(if (burstCount > 1) "Elaborazione ${snapshot.aiPreset.shortBadge} + Burst..." else "Elaborazione ${snapshot.aiPreset.shortBadge}...")
+        if (snapshot.activeHardwareExtension != null) {
+            onStatus("Scatto ${snapshot.activeHardwareExtension}...")
+        } else if (snapshot.aiPreset.isEnabled) {
+            onStatus(if (burstCount > 1) "Elaborazione ${snapshot.aiPreset.shortBadge} + Burst ${burstCount}x..." else "Elaborazione ${snapshot.aiPreset.shortBadge}...")
         }
 
         fun captureNextFrame(remaining: Int) {
@@ -453,9 +642,11 @@ class FreshCameraEngine(
                         profileIntensity = snapshot.profileIntensity,
                         brightnessBoost = snapshot.brightnessBoost,
                         aiPreset = snapshot.aiPreset,
+                        activeHardwareExtension = snapshot.activeHardwareExtension,
                         activeLens = snapshot.activeLens,
                         displayZoom = snapshot.displayZoom,
                         digitalExtraZoom = digitalExtraZoom,
+                        cloudModelPreset = snapshot.cloudModelPreset,
                         cloudEndpointUrl = snapshot.cloudEndpointUrl,
                         cloudApiKey = snapshot.cloudApiKey,
                         postSavePolish = snapshot.postSavePolishEnabled

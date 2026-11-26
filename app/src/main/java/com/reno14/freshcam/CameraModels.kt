@@ -16,7 +16,7 @@ enum class CameraProfile(
     val warmth: Float,
     val shadowLift: Float
 ) {
-    NATURAL("naturale", "Naturale", Color(0xFF4FC3F7), 1.02f, 1.01f, 0.0f, 0.0f),
+    NATURAL("naturale", "Naturale", Color(0xFF4FC3F7), 1.01f, 1.01f, 0.0f, 0.0f),
     VIVID("vivido", "Vivido", Color(0xFFFFA726), 1.10f, 1.22f, 0.015f, 0.005f),
     BW("bianco_nero", "Bianco e Nero", Color(0xFFE0E0E0), 1.18f, 0.0f, 0.0f, -0.01f),
     LEICA("leica", "Leica", Color(0xFFE53935), 1.08f, 0.99f, 0.015f, 0.0f),
@@ -76,26 +76,29 @@ enum class UnifiedAiPreset(
     val level: Int
 ) {
     OFF("AI Off", "AI Disattivata", false, false, 0),
-    LOCAL_LOW("AI Bassa", "Locale · Bassa", true, false, 1),
-    LOCAL_MED("AI Media", "Locale · Media", true, false, 2),
-    LOCAL_HIGH("AI Alta", "Locale · Alta", true, false, 3),
-    CLOUD_LOW("Cloud Bassa", "Cloud · Bassa", true, true, 1),
-    CLOUD_MED("Cloud Media", "Cloud · Media", true, true, 2),
-    CLOUD_HIGH("Cloud Alta", "Cloud · Alta", true, true, 3)
+    LOCAL_LOW("AI Bassa", "Locale · Bassa (Burst 3x)", true, false, 1),
+    LOCAL_MED("AI Media", "Locale · Media (Burst + Micro-Dettaglio)", true, false, 2),
+    LOCAL_HIGH("AI Alta", "HW Notte / Locale Alta (Burst 4x)", true, false, 3),
+    CLOUD_LOW("Cloud Bassa", "Cloud Generativa · Bassa", true, true, 1),
+    CLOUD_MED("Cloud Media", "Cloud Generativa · Media", true, true, 2),
+    CLOUD_HIGH("Cloud Alta", "Cloud Generativa · Alta", true, true, 3)
 }
 
-enum class CloudModelPreset(val label: String, val url: String) {
-    SWIN2SR_CLASSICAL_X2(
-        "Swin2SR Classical x2 (Fedele · Consigliato)",
-        "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-classical-sr-x2-64"
+enum class CloudModelPreset(val label: String, val url: String, val isReplicate: Boolean) {
+    REPLICATE_REALESRGAN(
+        "Replicate Real-ESRGAN (Consigliato · Ricostruzione Vera)",
+        "https://api.replicate.com/v1/models/nightmareai/real-esrgan/predictions",
+        true
     ),
-    SWIN2SR_LIGHT_X2(
-        "Swin2SR Light x2 (Veloce & Pulito)",
-        "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-lightweight-x2-64"
+    HF_REAL_ESRGAN(
+        "Hugging Face Swin2SR RealWorld x4",
+        "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
+        false
     ),
     CUSTOM(
         "Endpoint Personalizzato",
-        ""
+        "",
+        false
     )
 }
 
@@ -155,13 +158,16 @@ data class FreshCamState(
     val profile: CameraProfile = CameraProfile.NATURAL,
     val captureFormat: CaptureFormat = CaptureFormat.NORMAL,
     val aiPreset: UnifiedAiPreset = UnifiedAiPreset.LOCAL_MED,
-    val cloudModelPreset: CloudModelPreset = CloudModelPreset.SWIN2SR_CLASSICAL_X2,
+    val cloudModelPreset: CloudModelPreset = CloudModelPreset.REPLICATE_REALESRGAN,
     val timerMode: TimerMode = TimerMode.OFF,
     val countdownRemaining: Int = 0,
     val videoResolution: VideoResolution = VideoResolution.UHD_4K,
     val jpegQuality: Int = 98,
     val activeLens: LensType = LensType.MAIN_50MP,
     val detectedLenses: List<PhysicalLensInfo> = emptyList(),
+    val forceLogicalHwExtensions: Boolean = true,
+    val activeHardwareExtension: String? = null,
+    val hwExtensionsReport: String = "Scansione estensioni HW...",
     val focusMode: FocusMode = FocusMode.AI_LOCK,
     val isSubjectLocked: Boolean = false,
     val manualFocusDistance: Float = 0.5f,
@@ -177,8 +183,8 @@ data class FreshCamState(
     val shutterSpeedDenom: Int = 125,
     val stabilizationEnabled: Boolean = true,
     val cloudApiKey: String = "",
-    val cloudEndpointUrl: String = CloudModelPreset.SWIN2SR_CLASSICAL_X2.url,
-    val postSavePolishEnabled: Boolean = true,
+    val cloudEndpointUrl: String = CloudModelPreset.REPLICATE_REALESRGAN.url,
+    val postSavePolishEnabled: Boolean = false,
     val gridEnabled: Boolean = true,
     val locationTagEnabled: Boolean = false,
     val hasLocationPermission: Boolean = false,

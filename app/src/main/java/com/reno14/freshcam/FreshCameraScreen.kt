@@ -174,7 +174,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         }
     }
 
-    // Rilevamento lenti su thread IO (mai sul Main Thread -> zero blocchi all'avvio)
     LaunchedEffect(Unit) {
         val lenses = withContext(Dispatchers.IO) { engine.discoverLenses() }
         val hasLoc = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
@@ -206,11 +205,12 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         }
     }
 
-    // Re-bind della fotocamera con DEBOUNCE e solo per parametri strutturali (EV e Flash vanno live senza unbind!)
     LaunchedEffect(
         previewView,
         state.activeLens,
         state.captureFormat,
+        state.aiPreset,
+        state.forceLogicalHwExtensions,
         state.videoResolution,
         state.stabilizationEnabled,
         state.isoValue,
@@ -227,13 +227,18 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             onZoomBounds = { _, maxZ ->
                 state = state.copy(maxLensZoomRatio = maxZ.coerceAtLeast(10.0f))
             },
+            onExtensionUpdate = { activeExt, report ->
+                state = state.copy(
+                    activeHardwareExtension = activeExt,
+                    hwExtensionsReport = report
+                )
+            },
             onBanner = { msg ->
                 state = state.copy(bannerMessage = msg)
             }
         )
     }
 
-    // Aggiornamenti LIVE senza riavviare la fotocamera (elimina i freeze!)
     LaunchedEffect(state.evCompensation) {
         if (state.captureFormat != CaptureFormat.PRO) {
             engine.applyExposureCompensation(state.evCompensation)
@@ -244,14 +249,18 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         engine.applyFlashLive(state.flashMode)
     }
 
-    LaunchedEffect(state.lensZoomRatio) {
-        engine.setZoom(state.lensZoomRatio)
+    LaunchedEffect(state.lensZoomRatio, state.displayZoom, state.activeHardwareExtension) {
+        val targetZoom = if (state.activeHardwareExtension != null && state.forceLogicalHwExtensions) {
+            state.displayZoom
+        } else {
+            state.lensZoomRatio
+        }
+        engine.setZoom(targetZoom)
     }
 
     val latestState by rememberUpdatedState(state)
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // Mirino Fotocamera con Tap-to-Focus + Pinch-to-Zoom fluido
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -414,7 +423,12 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // UNICO TASTO AI (Off / Locale Bassa-Media-Alta / Cloud Bassa-Media-Alta)
+                val aiButtonText = when {
+                    !state.aiPreset.isEnabled -> "AI Off"
+                    state.activeHardwareExtension != null && !state.aiPreset.isCloud -> state.activeHardwareExtension!!
+                    state.activeHardwareExtension != null && state.aiPreset.isCloud -> "${state.activeHardwareExtension}+Cloud"
+                    else -> state.aiPreset.shortBadge
+                }
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(16.dp))
@@ -422,6 +436,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             when {
                                 !state.aiPreset.isEnabled -> Color.Black.copy(alpha = 0.65f)
                                 state.aiPreset.isCloud -> Color(0xFF7E57C2).copy(alpha = 0.92f)
+                                state.activeHardwareExtension != null -> Color(0xFF2E7D32).copy(alpha = 0.92f)
                                 else -> Color(0xFF00ACC1).copy(alpha = 0.92f)
                             }
                         )
@@ -437,7 +452,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.dp))
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = state.aiPreset.shortBadge,
+                            text = aiButtonText,
                             color = Color.White,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
@@ -543,7 +558,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 .padding(top = 6.dp, bottom = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // GHIERA ROTANTE ZOOM FLUIDA (fix pointerInput(Unit) -> reattiva al 100%)
             if (state.activeLens != LensType.FRONT) {
                 AnimatedVisibility(
                     visible = showZoomDial,
@@ -635,7 +649,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Anteprima reale dell'ultima foto
                 Box(
                     modifier = Modifier
                         .size(48.dp)
@@ -662,7 +675,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
                 }
 
-                // Pulsante Scatto con protezione anti-doppio-scatto (previene i blocchi di memoria)
                 Box(
                     modifier = Modifier
                         .size(74.dp)
@@ -770,8 +782,12 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 contentColor = Color.White
             ) {
                 Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)) {
-                    Text("Motore AI v13 (Computazionale & Cloud)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                    Text("Locale: Edge-Preserving su luminanza (zero impastamento) · Cloud: Swin2SR Classical", fontSize = 12.sp, color = Color.White.copy(alpha = 0.65f))
+                    Text("Motore AI v15 (Burst Tele 3.5x+ · HW · Cloud)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = state.hwExtensionsReport,
+                        fontSize = 11.sp,
+                        color = Color(0xFF81C784)
+                    )
                     Spacer(modifier = Modifier.height(12.dp))
 
                     FilterChip(
@@ -784,7 +800,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("AI Locale (Micro-Contrasto + HDR Naturale)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
+                    Text("AI Hardware / Locale (Burst 3x–4x da 3.5x + HW Notte su Alta)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(UnifiedAiPreset.LOCAL_LOW, UnifiedAiPreset.LOCAL_MED, UnifiedAiPreset.LOCAL_HIGH).forEach { preset ->
@@ -800,7 +816,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("AI in Cloud (Swin2SR Classical · Fusione Radiale)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB39DDB))
+                    Text("AI Generativa in Cloud (Replicate Real-ESRGAN)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB39DDB))
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(UnifiedAiPreset.CLOUD_LOW, UnifiedAiPreset.CLOUD_MED, UnifiedAiPreset.CLOUD_HIGH).forEach { preset ->
@@ -910,7 +926,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // IMPOSTAZIONI FOTO, VIDEO & CLOUD
+        // IMPOSTAZIONI FOTO, VIDEO, SBLOCCO HW & CLOUD
         if (sheet == SheetPage.SETTINGS) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -923,10 +939,22 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         .verticalScroll(rememberScrollState())
                         .padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
-                    Text("Impostazioni Foto & Video (v13)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                    Text("Motore Computazionale Stabile · Zoom fino a 120x", fontSize = 12.sp, color = Color(0xFF4FC3F7))
+                    Text("Impostazioni Foto & Video (v15)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("Estensioni HW: ${state.hwExtensionsReport}", fontSize = 11.sp, color = Color(0xFF81C784))
 
                     Spacer(modifier = Modifier.height(14.dp))
+                    HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Text("SBLOCCO ESTENSIONI HARDWARE", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF81C784))
+                    ToggleRow(
+                        title = "Forza Camera Logica per Estensioni HW",
+                        subtitle = "Usa la camera logica Oppo (invece dell'ID fisico) per mantenere attive le estensioni HW anche sullo zoom",
+                        checked = state.forceLogicalHwExtensions,
+                        onChange = { state = state.copy(forceLogicalHwExtensions = it) }
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(10.dp))
 
@@ -967,7 +995,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
                     ToggleRow(
                         title = "Curva Tonale Cinematografica",
-                        subtitle = "Protegge le alte luci mantenendo fedeltà cromatica",
+                        subtitle = "Aggiunge una leggera curva a S al salvataggio",
                         checked = state.postSavePolishEnabled,
                         onChange = { state = state.copy(postSavePolishEnabled = it) }
                     )
@@ -1009,7 +1037,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    Text("MODELLO CLOUD AI (FUSIONE RADIALE)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB39DDB))
+                    Text("CLOUD AI GENERATIVA (REPLICATE / HF)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB39DDB))
                     Spacer(modifier = Modifier.height(6.dp))
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         CloudModelPreset.entries.forEach { preset ->
@@ -1027,14 +1055,14 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     OutlinedTextField(
                         value = state.cloudApiKey,
                         onValueChange = { state = state.copy(cloudApiKey = it) },
-                        label = { Text("Token API Hugging Face (hf_...)") },
+                        label = { Text(if (state.cloudModelPreset.isReplicate) "Token API Replicate (r8_...)" else "Token API Hugging Face (hf_...)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                     )
                     OutlinedTextField(
                         value = state.cloudEndpointUrl,
                         onValueChange = { state = state.copy(cloudEndpointUrl = it, cloudModelPreset = CloudModelPreset.CUSTOM) },
-                        label = { Text("URL Endpoint Cloud SR") },
+                        label = { Text("URL Endpoint Cloud") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                     )
@@ -1054,9 +1082,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
     }
 }
 
-/**
- * Ghiera rotante zoom FLUIDA e REATTIVA (fix bug v12: pointerInput(Unit) + rememberUpdatedState).
- */
 @Composable
 private fun RotatingZoomDial(
     currentZoom: Float,

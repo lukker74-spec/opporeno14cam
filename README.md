@@ -1,6 +1,5 @@
-# Reno14 FreshCam v13.0 (Motore Computazionale Locale + Zero Freeze + Ghiera Fluida + Cloud Radiale)
+# Reno14 FreshCam v15.0 (Tentativo Sblocco HW Extensions + Burst Tele da 3.5x + Replicate Real-ESRGAN)
 
-- **Nuovo motore locale di fotografia computazionale (zero TFLite a tasselli):** piramide a 3 scale su sola luminanza con Noise-Gate (zero rumore su cielo/pelle), Local Tone Mapping (recupero ombre + protezione alte luci) e chroma denoise veloce.
-- **Risolti i blocchi dell'app:** rimosso NNAPI dal Main Thread, aggiunto debounce sul binding CameraX, EV e Flash aggiornati live senza riavviare la fotocamera, blocco anti-doppio-scatto e riduzione del 60% del picco RAM.
-- **Ghiera zoom fluida + Pinch-to-Zoom:** corretto il bug di `pointerInput` che bloccava la rotazione; ora gira istantaneamente fino a 120x e funziona anche con le due dita sul mirino.
-- **Cloud AI sostituita e corretta:** passata a `Swin2SR Classical x2` (addestrato su foto pulite) con fusione di sola luminanza e maschera radiale morbida (niente riquadro rettangolare, colori originali preservati).
+- **Tentativo Sblocco Estensioni HW:** nuova opzione *Forza Camera Logica per Estensioni HW* (attiva di default) che aggancia `DEFAULT_BACK_CAMERA` invece dell'ID fisico della tele, più scansione profonda Camera2 `CameraExtensionCharacteristics` su tutti gli ID posteriori.
+- **Teleobiettivo 3.5x–120x potenziato:** Burst multi-frame 3–4 scatti attivo già da `3.5x` + micro-contrasto a doppia scala tarato per il sensore `S5KJN5`.
+- **Nuova Cloud AI:** integrato **Replicate Real-ESRGAN** (ricostruzione generativa vera) selezionabile nelle Impostazioni.
