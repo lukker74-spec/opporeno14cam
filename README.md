@@ -1,9 +1,7 @@
-# Reno14 FreshCam v18.0 (Vera AI Neurale Locale ONNX + NPU NNAPI + RAW-in-RAM → JPEG)
+# Reno14 FreshCam v19.0 (Avvio Pulito, AI Locale Ibrida Full-Res + SPAN Zoom, UI Sistemata)
 
-- **Vera AI Generativa / Super-Resolution 100% Locale Offline (`OnnxGenerativeEngine.kt`):**
-  - Integra `onnxruntime-android:1.24.2` con due veri modelli neurali scaricati automaticamente in fase di build:
-    1. **`4x-ClearRealityV1.onnx` (SPAN 4x, 1.7 MB, predefinito):** veloce e fotorealistico, pulisce la grana e ricostruisce texture naturali.
-    2. **`realesr-general-x4v3.onnx` (Real-ESRGAN v3 4x, 4.9 MB):** ricostruzione più spinta per zoom estremi (20x–120x).
-  - Prova l'accelerazione **Android NNAPI FP16** (per delegare alla NPU/DSP Dimensity quando supportata) con fallback automatico e trasparente a **CPU ARM 4-Thread**, mostrando backend e tempo reale nel banner di salvataggio.
-- **Zero Cloud a pagamento:** Replicate rimosso completamente; resta solo l'opzione gratuita opzionale (Hugging Face con token gratuito `hf_...` o endpoint gratuito personalizzato) con avviso esplicito se non configurata.
-- **Fix banner con `AI Lock`:** il blocco fuoco non nasconde più i messaggi di salvataggio, tempi AI o errori.
+- **Avvio pulito e istantaneo:** AI Locale, AI Cloud e RAW-in-RAM sono **spenti all'avvio**; messa a fuoco su **Autofocus (`AF`)** (con scelta preservata per Manuale e AI Lock); Flash su **Off**; scatto a bassa latenza (`CAPTURE_MODE_MINIMIZE_LATENCY`) con thread dedicato `FreshCam-DirectSave` mai bloccato dalla coda AI.
+- **Nuova AI Locale Ibrida più efficace e più veloce:**
+  - Su **0.6x / 1x / 3.5x (fino a 6.5x)**: elaborazione a **piena risoluzione 12MP** senza alcun downscale distruttivo — Local HDR Tone Mapping (apre le ombre e recupera le luci), denoise selettivo sulle ombre, Clarity multi-scala, micro-nitidezza adattiva e Vibrance protetta sugli incarnati (~0.5–1.0s).
+  - Su **Zoom Spinti (`7x–120x`)**: carica `4x-ClearRealityV1.onnx` (SPAN) solo on-demand lavorando direttamente sul ritaglio ottico reale (3–4x più veloce della v18).
+- **UI sistemata:** l'icona **Impostazioni** è stata spostata nella barra inferiore accanto al cambio camera, eliminando completamente la sovrapposizione con il pulsante Focus in alto.

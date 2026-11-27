@@ -74,20 +74,12 @@ enum class CameraProfile(
 enum class LocalNeuralModel(
     val shortName: String,
     val displayName: String,
-    val assetPath: String,
-    val description: String
+    val assetPath: String
 ) {
     CLEAR_REALITY_SPAN(
         shortName = "SPAN",
-        displayName = "ClearReality SPAN 4x (Consigliato · Veloce & Fotorealistico)",
-        assetPath = "models/4x-ClearRealityV1.onnx",
-        description = "Rete neurale SPAN moderna (1.7 MB): pulisce grana e ombre con texture naturali e alta velocità su mobile."
-    ),
-    REAL_ESRGAN_V3(
-        shortName = "ESRGAN",
-        displayName = "Real-ESRGAN v3 4x (Ricostruzione Spinta · Zoom Estremi)",
-        assetPath = "models/realesr-general-x4v3.onnx",
-        description = "Rete GAN compatta (4.9 MB): ricostruzione bordi più incisiva, ottima su zoom 20x-120x."
+        displayName = "ClearReality SPAN 4x (Zoom 7x-120x)",
+        assetPath = "models/4x-ClearRealityV1.onnx"
     )
 }
 
@@ -98,21 +90,21 @@ enum class UnifiedAiPreset(
     val isCloud: Boolean,
     val level: Int
 ) {
-    OFF("AI Off", "AI Neurale Spenta (Solo Ottica / RAW)", false, false, 0),
-    LOCAL_LOW("AI Bassa", "AI Neurale Locale · Bassa (Naturale)", true, false, 1),
-    LOCAL_MED("AI Media", "AI Neurale Locale · Media (Bilanciata)", true, false, 2),
-    LOCAL_HIGH("AI Alta", "AI Neurale Locale · Alta (Massima Ricostruzione)", true, false, 3),
+    OFF("AI Off", "AI Spenta (Scatto Diretto Veloce)", false, false, 0),
+    LOCAL_LOW("AI Bassa", "AI Locale · Bassa (HDR + Dettaglio Naturale)", true, false, 1),
+    LOCAL_MED("AI Media", "AI Locale · Media (HDR + Ombre + Nitidezza)", true, false, 2),
+    LOCAL_HIGH("AI Alta", "AI Locale · Alta (Massimo Contrasto & Dettaglio)", true, false, 3),
     CLOUD_FREE_MED("Cloud Gratis", "Cloud Gratis HF · Media", true, true, 2),
     CLOUD_FREE_HIGH("Cloud Max", "Cloud Gratis HF · Alta", true, true, 3)
 }
 
 enum class FreeCloudPreset(val label: String, val url: String) {
     HF_SWIN2SR_FREE(
-        "Hugging Face Gratis (Router Swin2SR · Token hf_...)",
+        "Hugging Face Gratis (Swin2SR · Token hf_...)",
         "https://router.huggingface.co/hf-inference/models/caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr"
     ),
     CUSTOM_FREE(
-        "URL Personalizzato (es. tuo Space ZeroGPU / Server gratuito)",
+        "URL Personalizzato (es. Space ZeroGPU / Server gratuito)",
         ""
     )
 }
@@ -172,11 +164,13 @@ data class PhysicalLensInfo(
 data class FreshCamState(
     val profile: CameraProfile = CameraProfile.NATURAL,
     val captureFormat: CaptureFormat = CaptureFormat.NORMAL,
-    val aiPreset: UnifiedAiPreset = UnifiedAiPreset.LOCAL_MED,
+    // v19: AI Locale e Cloud SPENTE all'avvio per scatti immediati e zero overhead
+    val aiPreset: UnifiedAiPreset = UnifiedAiPreset.OFF,
     val localNeuralModel: LocalNeuralModel = LocalNeuralModel.CLEAR_REALITY_SPAN,
     val preferNnapiNpu: Boolean = true,
-    val localAiBackendStatus: String = "In attesa di inizializzazione ONNX...",
-    val rawInRamEnabled: Boolean = true,
+    val localAiBackendStatus: String = "Standby (si carica solo su Zoom >= 7x)",
+    // v19: RAW-in-RAM spento all'avvio (attivabile opzionalmente dalle Impostazioni)
+    val rawInRamEnabled: Boolean = false,
     val backgroundProcessingEnabled: Boolean = true,
     val backgroundJobsCount: Int = 0,
     val freeCloudPreset: FreeCloudPreset = FreeCloudPreset.HF_SWIN2SR_FREE,
@@ -192,12 +186,14 @@ data class FreshCamState(
     val forceLogicalHwExtensions: Boolean = true,
     val activeHardwareExtension: String? = null,
     val hwExtensionsReport: String = "Scansione estensioni HW...",
-    val sensorCapabilitiesReport: String = "Scansione sensori 50MP / RAW...",
-    val focusMode: FocusMode = FocusMode.AI_LOCK,
+    val sensorCapabilitiesReport: String = "Scansione sensori...",
+    // v19: Parte in Autofocus (AF), mantenendo scelta tra AF, Manuale e AI Lock
+    val focusMode: FocusMode = FocusMode.AUTO,
     val isSubjectLocked: Boolean = false,
     val manualFocusDistance: Float = 0.5f,
     val shootingMode: ShootingMode = ShootingMode.PHOTO,
-    val flashMode: FlashMode = FlashMode.AUTO,
+    // v19: Flash OFF di default per evitare pre-capture lenti in interno
+    val flashMode: FlashMode = FlashMode.OFF,
     val displayZoom: Float = 1.0f,
     val lensZoomRatio: Float = 1.0f,
     val maxLensZoomRatio: Float = 34.3f,

@@ -25,31 +25,20 @@ data class LocalAiOutcome(
 )
 
 /**
- * Motore di AI Generativa / Super-Resolution REALE 100% Locale (Offline) via ONNX Runtime:
- * - Carica i veri pesi neurali .onnx da assets/models/ (ClearReality SPAN 4x o Real-ESRGAN v3 4x).
- * - Prova ad accelerare le operazioni su Dimensity NPU/DSP tramite Android NNAPI (FP16),
- *   con fallback automatico e trasparente a CPU ARM multi-thread se un operatore non è supportato.
- * - Elabora l'immagine a tasselli sovrapposti senza giunture visibili e applica miscela intelligente
- *   (più forte sulle ombre rumorose e sugli zoom spinti) restituendo tempo reale e backend usato.
+ * Motore Neurale ONNX v19 (Lazy-Loaded SOLO per Zoom Spinti >= 7x):
+ * - Non viene MAI caricato all'avvio dell'app (zero impatto su memoria e velocità).
+ * - Lavora solo sul ritaglio ottico reale a bassa risoluzione (zoom 7x-120x), dove una rete
+ *   di Super-Resolution 4x (SPAN ClearReality) ricostruisce davvero dettagli e bordi in 1-3s!
+ * - Non viene più usato su 1x/3.5x (dove il downscale distruggeva i 12MP reali).
  */
 class OnnxGenerativeEngine(private val context: Context) {
 
     private var activeSession: OrtSession? = null
     private var loadedModel: LocalNeuralModel? = null
     private var loadedPreferNnapi: Boolean? = null
-    private var activeBackendName: String = "Non inizializzato"
+    private var activeBackendName: String = "Standby"
     private var inputName: String = "input"
     private var isNhwcInput: Boolean = false
-
-    @Synchronized
-    fun probeRuntimeStatus(model: LocalNeuralModel, preferNnapi: Boolean): String {
-        return try {
-            ensureSession(model, preferNnapi)
-            "Pronto · ${model.shortName} ($activeBackendName)"
-        } catch (t: Throwable) {
-            "Errore modello ${model.shortName}: ${t.localizedMessage}"
-        }
-    }
 
     @Synchronized
     private fun ensureSession(model: LocalNeuralModel, preferNnapi: Boolean): OrtSession {
@@ -64,7 +53,6 @@ class OnnxGenerativeEngine(private val context: Context) {
         val modelFile = materializeAssetToFilesDir(model.assetPath)
         val env = OrtEnvironment.getEnvironment()
 
-        // 1. Prova prima con NNAPI (delega su Dimensity NPU/DSP quando supportato dal driver)
         if (preferNnapi) {
             try {
                 val opts = OrtSession.SessionOptions().apply {
@@ -78,14 +66,12 @@ class OnnxGenerativeEngine(private val context: Context) {
                 loadedModel = model
                 loadedPreferNnapi = true
                 activeBackendName = "NNAPI/NPU"
-                Log.i("OnnxGenAI", "Sessione creata con NNAPI/NPU per ${model.shortName}")
                 return sess
             } catch (t: Throwable) {
-                Log.w("OnnxGenAI", "NNAPI non compatibile per ${model.shortName}, uso CPU ARM: ${t.message}")
+                Log.w("OnnxGenAI", "NNAPI fallback a CPU: ${t.message}")
             }
         }
 
-        // 2. Fallback solido: CPU ARM 64-bit multi-thread (funziona sempre al 100%)
         val cpuOpts = OrtSession.SessionOptions().apply {
             setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
             setIntraOpNumThreads(4)
@@ -96,7 +82,6 @@ class OnnxGenerativeEngine(private val context: Context) {
         loadedModel = model
         loadedPreferNnapi = preferNnapi
         activeBackendName = "CPU 4-Thread"
-        Log.i("OnnxGenAI", "Sessione CPU creata per ${model.shortName}")
         return sess
     }
 
@@ -104,7 +89,6 @@ class OnnxGenerativeEngine(private val context: Context) {
         inputName = session.inputNames.firstOrNull() ?: "input"
         val info = session.inputInfo[inputName]?.info as? TensorInfo
         val shape = info?.shape
-        // Standard è [1, 3, H, W] (NCHW); se shape[3] == 3 allora è NHWC
         isNhwcInput = shape != null && shape.size == 4 && shape[3] == 3L && shape[1] != 3L
     }
 
@@ -122,61 +106,47 @@ class OnnxGenerativeEngine(private val context: Context) {
             }
         }
         if (outFile.length() < 100_000L) {
-            throw IllegalStateException("File modello $fileName corrotto o mancante negli assets")
+            throw IllegalStateException("File modello $fileName mancante negli assets")
         }
         return outFile
     }
 
     /**
-     * Esegue la vera rete neurale 4x in locale sul fotogramma.
-     * - Su zoom spinti (>= 7x): prende la porzione ottica reale e la ricostruisce 4x con la GAN.
-     * - Su 1x / 3.5x: esegue il restauro neurale 4x ad alta risoluzione e lo fonde in modo
-     *   consapevole delle ombre (massima pulizia sulle zone scure, nitidezza naturale sulle luci).
+     * Ricostruzione Neurale 4x ottimizzata per Zoom Spinti (>= 7x).
+     * Usa solo 4-9 tasselli sul ritaglio ottico reale per massima velocità (1-3s) e alta resa.
      */
-    fun enhancePhoto(
+    fun enhanceZoomedCrop(
         source: Bitmap,
         model: LocalNeuralModel,
         level: Int,
-        displayZoom: Float,
         preferNnapi: Boolean
     ): LocalAiOutcome {
         val t0 = SystemClock.elapsedRealtime()
-        val isExtremeZoom = displayZoom >= 6.5f
 
         val session = try {
             ensureSession(model, preferNnapi)
         } catch (t: Throwable) {
             return LocalAiOutcome(
                 bitmap = source,
-                label = "AI Locale ERRORE",
+                label = "SPAN ERR",
                 backendUsed = "Errore",
                 elapsedMs = SystemClock.elapsedRealtime() - t0,
-                error = t.localizedMessage ?: "Impossibile caricare il modello ONNX"
+                error = t.localizedMessage ?: "Impossibile caricare ONNX"
             )
         }
 
-        // Dimensione di ingresso calibrata per qualità visibile + tempo sostenibile in background
-        val targetMaxInSide = if (isExtremeZoom) {
-            when (level) {
-                1 -> 384
-                2 -> 480
-                else -> 576
-            }
-        } else {
-            when (level) {
-                1 -> 512
-                2 -> 640
-                else -> 768
-            }
+        // Ingresso compatto e rapido (es. 320px * 4 = 1280px reali ricostruiti -> solo 4-6 tile!)
+        val maxInSide = when (level) {
+            1 -> 288
+            2 -> 352
+            else -> 416
         }
 
-        val inputBmp = scaleToMaxSide(source, targetMaxInSide)
+        val inputBmp = scaleToMaxSide(source, maxInSide)
         val srResult = try {
             runTiled4xInference(session, inputBmp)
         } catch (t: Throwable) {
-            // Se NNAPI fallisce a runtime su un tile, riprova una volta su CPU pura
             if (activeBackendName.contains("NNAPI")) {
-                Log.w("OnnxGenAI", "Errore runtime NNAPI (${t.message}), riprovo su CPU...")
                 try {
                     val cpuSession = ensureSession(model, preferNnapi = false)
                     runTiled4xInference(cpuSession, inputBmp)
@@ -184,7 +154,7 @@ class OnnxGenerativeEngine(private val context: Context) {
                     if (inputBmp !== source && !inputBmp.isRecycled) inputBmp.recycle()
                     return LocalAiOutcome(
                         bitmap = source,
-                        label = "AI Locale ERRORE",
+                        label = "SPAN ERR",
                         backendUsed = activeBackendName,
                         elapsedMs = SystemClock.elapsedRealtime() - t0,
                         error = cpuErr.localizedMessage ?: "Errore inferenza ONNX"
@@ -194,7 +164,7 @@ class OnnxGenerativeEngine(private val context: Context) {
                 if (inputBmp !== source && !inputBmp.isRecycled) inputBmp.recycle()
                 return LocalAiOutcome(
                     bitmap = source,
-                    label = "AI Locale ERRORE",
+                    label = "SPAN ERR",
                     backendUsed = activeBackendName,
                     elapsedMs = SystemClock.elapsedRealtime() - t0,
                     error = t.localizedMessage ?: "Errore inferenza ONNX"
@@ -204,10 +174,8 @@ class OnnxGenerativeEngine(private val context: Context) {
 
         if (inputBmp !== source && !inputBmp.isRecycled) inputBmp.recycle()
 
-        // Adatta l'output neurale alla risoluzione target e applica fusione guidata da livello e ombre
-        val outW = if (isExtremeZoom) max(source.width, srResult.width).coerceAtMost(4096) else source.width
-        val outH = if (isExtremeZoom) max(source.height, srResult.height).coerceAtMost(3072) else source.height
-
+        val outW = max(source.width, srResult.width).coerceAtMost(3200)
+        val outH = max(source.height, srResult.height).coerceAtMost(2400)
         val scaledSr = if (srResult.width != outW || srResult.height != outH) {
             val s = Bitmap.createScaledBitmap(srResult, outW, outH, true)
             srResult.recycle()
@@ -216,8 +184,7 @@ class OnnxGenerativeEngine(private val context: Context) {
             srResult
         }
 
-        val finalBmp = if (isExtremeZoom && level >= 3) {
-            // Su zoom spinto + AI Alta: 100% ricostruzione neurale pura
+        val finalBmp = if (level >= 3) {
             scaledSr
         } else {
             val baseScaled = if (source.width != outW || source.height != outH) {
@@ -225,20 +192,8 @@ class OnnxGenerativeEngine(private val context: Context) {
             } else {
                 source
             }
-            val baseStrength = if (isExtremeZoom) {
-                when (level) {
-                    1 -> 0.60f
-                    2 -> 0.85f
-                    else -> 1.0f
-                }
-            } else {
-                when (level) {
-                    1 -> 0.42f
-                    2 -> 0.68f
-                    else -> 0.90f
-                }
-            }
-            val blended = shadowWeightedBlend(baseScaled, scaledSr, baseStrength, boostShadows = !isExtremeZoom)
+            val alpha = if (level == 1) 0.65f else 0.85f
+            val blended = blendBitmaps(baseScaled, scaledSr, alpha)
             if (baseScaled !== source && !baseScaled.isRecycled) baseScaled.recycle()
             if (!scaledSr.isRecycled) scaledSr.recycle()
             blended
@@ -248,17 +203,12 @@ class OnnxGenerativeEngine(private val context: Context) {
         val secStr = String.format(java.util.Locale.US, "%.1fs", elapsed / 1000.0)
         return LocalAiOutcome(
             bitmap = finalBmp,
-            label = "${model.shortName} AI ($activeBackendName · $secStr)",
+            label = "Zoom SPAN ($activeBackendName · $secStr)",
             backendUsed = activeBackendName,
             elapsedMs = elapsed
         )
     }
 
-    /**
-     * Inferenza 4x a tasselli sovrapposti senza giunture:
-     * Ogni tassello ha un bordo di contesto di 12px che viene scartato dopo la rete neurale,
-     * copiando solo il nucleo interno privo di artefatti di bordo.
-     */
     private fun runTiled4xInference(session: OrtSession, inputBmp: Bitmap): Bitmap {
         val env = OrtEnvironment.getEnvironment()
         val inW = inputBmp.width
@@ -271,8 +221,8 @@ class OnnxGenerativeEngine(private val context: Context) {
         val outH = inH * scale
         val outPixels = IntArray(outW * outH)
 
-        val coreStep = 128
-        val pad = 12
+        val coreStep = 144
+        val pad = 10
 
         var y0 = 0
         while (y0 < inH) {
@@ -280,7 +230,6 @@ class OnnxGenerativeEngine(private val context: Context) {
             val cropY0 = max(0, y0 - pad)
             val cropY1 = min(inH, y1 + pad)
             val rawTileH = cropY1 - cropY0
-            // Allinea dimensioni del tile a multiplo di 8 (minimo 32) per piena compatibilità ONNX/NNAPI
             val tileH = max(32, ((rawTileH + 7) / 8) * 8)
 
             var x0 = 0
@@ -346,7 +295,6 @@ class OnnxGenerativeEngine(private val context: Context) {
                         val outTileW = if (outIsNhwc) outShape[2].toInt() else outShape[3].toInt()
                         val outPlane = outTileW * outTileH
 
-                        // Auto-rilevamento range [0..1] vs [0..255]
                         var peak = 0f
                         var sIdx = 0
                         while (sIdx < outFloats.size) {
@@ -400,17 +348,7 @@ class OnnxGenerativeEngine(private val context: Context) {
         return outBmp
     }
 
-    /**
-     * Miscela intelligente tra foto ottica/RAW e ricostruzione neurale:
-     * Sugli oggetti scuri (dove nasce la grana) aumenta il peso della rete neurale per
-     * pulire le ombre preservando naturalezza sulle zone molto illuminate.
-     */
-    private fun shadowWeightedBlend(
-        original: Bitmap,
-        neural: Bitmap,
-        baseAlpha: Float,
-        boostShadows: Boolean
-    ): Bitmap {
+    private fun blendBitmaps(original: Bitmap, neural: Bitmap, alpha: Float): Bitmap {
         val w = original.width
         val h = original.height
         val total = w * h
@@ -418,35 +356,14 @@ class OnnxGenerativeEngine(private val context: Context) {
         val neurPx = IntArray(total)
         original.getPixels(origPx, 0, w, 0, 0, w, h)
         neural.getPixels(neurPx, 0, w, 0, 0, w, h)
+        val inv = 1f - alpha
 
-        val shadowAlpha = (baseAlpha + 0.22f).coerceIn(baseAlpha, 0.96f)
         for (i in 0 until total) {
             val o = origPx[i]
             val n = neurPx[i]
-            val or = (o ushr 16) and 0xFF
-            val og = (o ushr 8) and 0xFF
-            val ob = o and 0xFF
-
-            val nr = (n ushr 16) and 0xFF
-            val ng = (n ushr 8) and 0xFF
-            val nb = n and 0xFF
-
-            val alpha = if (boostShadows) {
-                val y = (77 * or + 150 * og + 29 * ob) shr 8
-                if (y < 95) {
-                    val t = (95 - y) / 95f
-                    baseAlpha + (shadowAlpha - baseAlpha) * t
-                } else {
-                    baseAlpha
-                }
-            } else {
-                baseAlpha
-            }
-
-            val inv = 1f - alpha
-            val r = (or * inv + nr * alpha + 0.5f).toInt().coerceIn(0, 255)
-            val g = (og * inv + ng * alpha + 0.5f).toInt().coerceIn(0, 255)
-            val b = (ob * inv + nb * alpha + 0.5f).toInt().coerceIn(0, 255)
+            val r = (((o ushr 16) and 0xFF) * inv + ((n ushr 16) and 0xFF) * alpha + 0.5f).toInt().coerceIn(0, 255)
+            val g = (((o ushr 8) and 0xFF) * inv + ((n ushr 8) and 0xFF) * alpha + 0.5f).toInt().coerceIn(0, 255)
+            val b = ((o and 0xFF) * inv + (n and 0xFF) * alpha + 0.5f).toInt().coerceIn(0, 255)
             origPx[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
         }
 

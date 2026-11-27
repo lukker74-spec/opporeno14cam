@@ -193,19 +193,9 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         )
     }
 
-    // Inizializza in background il modello neurale ONNX locale per mostrare subito lo stato reale (NNAPI/NPU vs CPU)
-    LaunchedEffect(state.localNeuralModel, state.preferNnapiNpu) {
-        val model = state.localNeuralModel
-        val pref = state.preferNnapiNpu
-        val status = withContext(Dispatchers.IO) {
-            engine.probeLocalAiStatus(model, pref)
-        }
-        state = state.copy(localAiBackendStatus = status)
-    }
-
     LaunchedEffect(state.bannerMessage) {
         if (state.bannerMessage != null) {
-            delay(4200)
+            delay(3600)
             state = state.copy(bannerMessage = null)
         }
     }
@@ -228,7 +218,6 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
         previewView,
         state.activeLens,
         state.captureFormat,
-        state.aiPreset,
         state.forceLogicalHwExtensions,
         state.videoResolution,
         state.stabilizationEnabled,
@@ -372,175 +361,154 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // BARRA SUPERIORE
+        // BARRA SUPERIORE PULITA (v19: l'icona Impostazioni è stata spostata in basso -> zero sovrapposizioni sul Focus!)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(horizontal = 8.dp, vertical = 8.dp),
+                .padding(horizontal = 10.dp, vertical = 8.dp)
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
-                modifier = Modifier
-                    .weight(1f)
-                    .horizontalScroll(rememberScrollState()),
-                verticalAlignment = Alignment.CenterVertically
+            IconButton(
+                onClick = {
+                    val next = when (state.flashMode) {
+                        FlashMode.OFF -> FlashMode.AUTO
+                        FlashMode.AUTO -> FlashMode.ON
+                        FlashMode.ON -> FlashMode.TORCH
+                        FlashMode.TORCH -> FlashMode.OFF
+                    }
+                    state = state.copy(flashMode = next, bannerMessage = "Flash: ${next.label}")
+                },
+                modifier = Modifier.size(36.dp)
             ) {
-                IconButton(
-                    onClick = {
-                        val next = when (state.flashMode) {
-                            FlashMode.OFF -> FlashMode.AUTO
-                            FlashMode.AUTO -> FlashMode.ON
-                            FlashMode.ON -> FlashMode.TORCH
-                            FlashMode.TORCH -> FlashMode.OFF
+                Icon(
+                    imageVector = when (state.flashMode) {
+                        FlashMode.OFF -> Icons.Default.FlashOff
+                        FlashMode.AUTO -> Icons.Default.FlashAuto
+                        FlashMode.ON, FlashMode.TORCH -> Icons.Default.FlashOn
+                    },
+                    contentDescription = "Flash",
+                    tint = if (state.flashMode == FlashMode.OFF) Color.White.copy(alpha = 0.78f) else state.profile.accentColor
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(
+                        if (state.timerMode != TimerMode.OFF) state.profile.accentColor.copy(alpha = 0.85f)
+                        else Color.Black.copy(alpha = 0.62f)
+                    )
+                    .clickable {
+                        val next = when (state.timerMode) {
+                            TimerMode.OFF -> TimerMode.SEC_3
+                            TimerMode.SEC_3 -> TimerMode.SEC_5
+                            TimerMode.SEC_5 -> TimerMode.SEC_10
+                            TimerMode.SEC_10 -> TimerMode.OFF
                         }
-                        state = state.copy(flashMode = next, bannerMessage = "Flash: ${next.label}")
+                        state = state.copy(timerMode = next, bannerMessage = "Autoscatto: ${next.label}")
                     }
-                ) {
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        imageVector = when (state.flashMode) {
-                            FlashMode.OFF -> Icons.Default.FlashOff
-                            FlashMode.AUTO -> Icons.Default.FlashAuto
-                            FlashMode.ON, FlashMode.TORCH -> Icons.Default.FlashOn
-                        },
-                        contentDescription = "Flash",
-                        tint = if (state.flashMode == FlashMode.OFF) Color.White.copy(alpha = 0.75f) else state.profile.accentColor
+                        Icons.Default.Timer,
+                        contentDescription = "Autoscatto",
+                        tint = if (state.timerMode != TimerMode.OFF) Color.Black else Color.White,
+                        modifier = Modifier.size(14.dp)
                     )
-                }
-
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(
-                            if (state.timerMode != TimerMode.OFF) state.profile.accentColor.copy(alpha = 0.85f)
-                            else Color.Black.copy(alpha = 0.60f)
-                        )
-                        .clickable {
-                            val next = when (state.timerMode) {
-                                TimerMode.OFF -> TimerMode.SEC_3
-                                TimerMode.SEC_3 -> TimerMode.SEC_5
-                                TimerMode.SEC_5 -> TimerMode.SEC_10
-                                TimerMode.SEC_10 -> TimerMode.OFF
-                            }
-                            state = state.copy(timerMode = next, bannerMessage = "Autoscatto: ${next.label}")
-                        }
-                        .padding(horizontal = 8.dp, vertical = 6.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Default.Timer,
-                            contentDescription = "Autoscatto",
-                            tint = if (state.timerMode != TimerMode.OFF) Color.Black else Color.White,
-                            modifier = Modifier.size(14.dp)
-                        )
-                        if (state.timerMode != TimerMode.OFF) {
-                            Spacer(modifier = Modifier.width(3.dp))
-                            Text(state.timerMode.label, color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        }
+                    if (state.timerMode != TimerMode.OFF) {
+                        Spacer(modifier = Modifier.width(3.dp))
+                        Text(state.timerMode.label, color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     }
                 }
+            }
 
-                Spacer(modifier = Modifier.width(6.dp))
+            val rawInRamActiveNow = state.rawInRamEnabled &&
+                state.shootingMode == ShootingMode.PHOTO &&
+                state.captureFormat == CaptureFormat.NORMAL &&
+                state.activeHardwareExtension == null &&
+                (state.activeLens == LensType.MAIN_50MP || state.activeLens == LensType.TELE_50MP)
 
-                val rawInRamActiveNow = state.rawInRamEnabled &&
-                    state.shootingMode == ShootingMode.PHOTO &&
-                    state.captureFormat == CaptureFormat.NORMAL &&
-                    state.activeHardwareExtension == null &&
-                    (state.activeLens == LensType.MAIN_50MP || state.activeLens == LensType.TELE_50MP)
-
-                val aiButtonText = when {
-                    rawInRamActiveNow && state.aiPreset.isEnabled && !state.aiPreset.isCloud -> "RAW+${state.localNeuralModel.shortName}"
-                    rawInRamActiveNow && state.aiPreset.isCloud -> "RAW+Cloud"
-                    rawInRamActiveNow -> "RAW→JPG"
-                    state.activeHardwareExtension != null -> state.activeHardwareExtension!!
-                    !state.aiPreset.isEnabled -> "AI Off"
-                    state.aiPreset.isCloud -> state.aiPreset.shortBadge
-                    else -> "${state.localNeuralModel.shortName} ${state.aiPreset.shortBadge.removePrefix("AI ")}"
-                }
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(
-                            when {
-                                state.aiPreset.isCloud -> Color(0xFF7E57C2).copy(alpha = 0.92f)
-                                rawInRamActiveNow && state.aiPreset.isEnabled -> Color(0xFF00838F).copy(alpha = 0.95f)
-                                rawInRamActiveNow -> Color(0xFF00897B).copy(alpha = 0.94f)
-                                state.activeHardwareExtension != null -> Color(0xFF2E7D32).copy(alpha = 0.92f)
-                                !state.aiPreset.isEnabled -> Color.Black.copy(alpha = 0.65f)
-                                else -> Color(0xFF0288D1).copy(alpha = 0.94f)
-                            }
-                        )
-                        .border(
-                            1.dp,
-                            if (rawInRamActiveNow || state.aiPreset.isEnabled || state.activeHardwareExtension != null) Color.White else Color.White.copy(alpha = 0.35f),
-                            RoundedCornerShape(16.dp)
-                        )
-                        .clickable { sheet = SheetPage.AI_SELECTOR }
-                        .padding(horizontal = 10.dp, vertical = 6.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = aiButtonText,
-                            color = Color.White,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.width(6.dp))
-
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Color.Black.copy(alpha = 0.65f))
-                        .border(1.dp, state.profile.accentColor.copy(alpha = 0.65f), RoundedCornerShape(16.dp))
-                        .clickable { sheet = SheetPage.PROFILE_FORMAT }
-                        .padding(horizontal = 10.dp, vertical = 6.dp)
-                ) {
+            val aiButtonText = when {
+                rawInRamActiveNow && state.aiPreset.isEnabled -> "RAW+${state.aiPreset.shortBadge}"
+                rawInRamActiveNow -> "RAW→JPG"
+                state.activeHardwareExtension != null -> state.activeHardwareExtension!!
+                !state.aiPreset.isEnabled -> "AI Off"
+                else -> state.aiPreset.shortBadge
+            }
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(
+                        when {
+                            state.aiPreset.isCloud -> Color(0xFF7E57C2).copy(alpha = 0.92f)
+                            rawInRamActiveNow -> Color(0xFF00897B).copy(alpha = 0.94f)
+                            state.activeHardwareExtension != null -> Color(0xFF2E7D32).copy(alpha = 0.92f)
+                            !state.aiPreset.isEnabled -> Color.Black.copy(alpha = 0.65f)
+                            else -> Color(0xFF0288D1).copy(alpha = 0.94f)
+                        }
+                    )
+                    .border(
+                        1.dp,
+                        if (rawInRamActiveNow || state.aiPreset.isEnabled || state.activeHardwareExtension != null) Color.White else Color.White.copy(alpha = 0.35f),
+                        RoundedCornerShape(16.dp)
+                    )
+                    .clickable { sheet = SheetPage.AI_SELECTOR }
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "${state.profile.displayName} · ${state.captureFormat.badge}",
+                        text = aiButtonText,
                         color = Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-
-                Spacer(modifier = Modifier.width(6.dp))
-
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Color.Black.copy(alpha = 0.65f))
-                        .clickable { sheet = SheetPage.FOCUS }
-                        .padding(horizontal = 9.dp, vertical = 6.dp)
-                ) {
-                    Text(
-                        text = state.focusMode.shortLabel,
-                        color = if (state.isSubjectLocked) Color(0xFFFFCA28) else state.profile.accentColor,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.width(6.dp))
-
-            IconButton(
-                onClick = { sheet = SheetPage.SETTINGS },
+            Box(
                 modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .background(Color(0xFF1A222D).copy(alpha = 0.90f))
-                    .border(1.dp, Color.White.copy(alpha = 0.35f), CircleShape)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color.Black.copy(alpha = 0.65f))
+                    .border(1.dp, state.profile.accentColor.copy(alpha = 0.65f), RoundedCornerShape(16.dp))
+                    .clickable { sheet = SheetPage.PROFILE_FORMAT }
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
             ) {
-                Icon(Icons.Default.Settings, contentDescription = "Impostazioni Foto e Video", tint = Color.White)
+                Text(
+                    text = "${state.profile.displayName} · ${state.captureFormat.badge}",
+                    color = Color.White,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color.Black.copy(alpha = 0.68f))
+                    .border(
+                        1.dp,
+                        if (state.isSubjectLocked) Color(0xFFFFCA28) else state.profile.accentColor.copy(alpha = 0.55f),
+                        RoundedCornerShape(16.dp)
+                    )
+                    .clickable { sheet = SheetPage.FOCUS }
+                    .padding(horizontal = 11.dp, vertical = 6.dp)
+            ) {
+                Text(
+                    text = state.focusMode.shortLabel,
+                    color = if (state.isSubjectLocked) Color(0xFFFFCA28) else state.profile.accentColor,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
 
-        // FIX v18: Indicatori superiori INDIPENDENTI! AI Lock NON nasconde più i banner di salvataggio/errore!
+        // Indicatori superiori indipendenti
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -564,9 +532,9 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     val label = if (state.backgroundJobsCount == 1) {
-                        "AI & Multi-Frame in background (1 foto)..."
+                        "Elaborazione AI in background (1 foto)..."
                     } else {
-                        "AI & Multi-Frame in background (${state.backgroundJobsCount} foto)..."
+                        "Elaborazione AI in background (${state.backgroundJobsCount} foto)..."
                     }
                     Text(label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                 }
@@ -621,7 +589,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 title = { Text("Cloud Gratuito non configurato", fontWeight = FontWeight.Bold) },
                 text = {
                     Text(
-                        "Per usare il Cloud gratuito devi inserire il tuo token gratuito Hugging Face (hf_..., nessuna carta richiesta) oppure un URL di un tuo endpoint gratuito nelle Impostazioni.\n\nIn alternativa puoi usare la nuova AI Neurale Locale ONNX (100% offline e gratuita, già attiva!)."
+                        "Per usare il Cloud gratuito devi inserire il tuo token gratuito Hugging Face (hf_..., nessuna carta richiesta) oppure un URL di un tuo endpoint gratuito nelle Impostazioni.\n\nIn alternativa puoi attivare la nuova AI Locale Full-Res (100% offline e istantanea)."
                     )
                 },
                 confirmButton = {
@@ -646,7 +614,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             )
         }
 
-        // BLOCCO INFERIORE
+        // BLOCCO INFERIORE (v19: include l'icona Impostazioni ben distanziata accanto al cambio camera)
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -742,13 +710,16 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 28.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+            // Barra scatto bilanciata: [Galleria] --- [Scatto centrato] --- [Cambio Camera] [Impostazioni]
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
             ) {
+                // Sinistra: Galleria
                 Box(
                     modifier = Modifier
+                        .align(Alignment.CenterStart)
                         .size(48.dp)
                         .clip(CircleShape)
                         .background(Color.White.copy(alpha = 0.14f))
@@ -773,8 +744,10 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
                 }
 
+                // Centro: Pulsante di Scatto
                 Box(
                     modifier = Modifier
+                        .align(Alignment.Center)
                         .size(74.dp)
                         .clip(CircleShape)
                         .border(4.dp, if (state.isCapturing) Color.Gray else Color.White, CircleShape)
@@ -850,36 +823,55 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     )
                 }
 
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.14f))
-                        .clickable {
-                            if (state.activeLens == LensType.FRONT) {
-                                state = state.copy(
-                                    activeLens = LensType.MAIN_50MP,
-                                    displayZoom = 1.0f,
-                                    lensZoomRatio = 1.0f,
-                                    bannerMessage = LensType.MAIN_50MP.label
-                                )
-                            } else {
-                                state = state.copy(
-                                    activeLens = LensType.FRONT,
-                                    displayZoom = 1.0f,
-                                    lensZoomRatio = 1.0f,
-                                    bannerMessage = LensType.FRONT.label
-                                )
-                            }
-                        },
-                    contentAlignment = Alignment.Center
+                // Destra: Cambio Camera + Impostazioni (spostate qui in basso!)
+                Row(
+                    modifier = Modifier.align(Alignment.CenterEnd),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Default.Cameraswitch, contentDescription = "Cambia camera", tint = Color.White, modifier = Modifier.size(22.dp))
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(Color.White.copy(alpha = 0.14f))
+                            .clickable {
+                                if (state.activeLens == LensType.FRONT) {
+                                    state = state.copy(
+                                        activeLens = LensType.MAIN_50MP,
+                                        displayZoom = 1.0f,
+                                        lensZoomRatio = 1.0f,
+                                        bannerMessage = LensType.MAIN_50MP.label
+                                    )
+                                } else {
+                                    state = state.copy(
+                                        activeLens = LensType.FRONT,
+                                        displayZoom = 1.0f,
+                                        lensZoomRatio = 1.0f,
+                                        bannerMessage = LensType.FRONT.label
+                                    )
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Default.Cameraswitch, contentDescription = "Cambia camera", tint = Color.White, modifier = Modifier.size(21.dp))
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF1A222D).copy(alpha = 0.92f))
+                            .border(1.dp, Color.White.copy(alpha = 0.35f), CircleShape)
+                            .clickable { sheet = SheetPage.SETTINGS },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Default.Settings, contentDescription = "Impostazioni", tint = Color.White, modifier = Modifier.size(21.dp))
+                    }
                 }
             }
         }
 
-        // MENU UNIFICATO AI NEURALE LOCALE & RAW-IN-RAM
+        // MENU AI LOCALE IBRIDA v19 & CLOUD GRATUITO
         if (sheet == SheetPage.AI_SELECTOR) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -892,50 +884,15 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         .verticalScroll(rememberScrollState())
                         .padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
-                    Text("Vera AI Neurale Locale & RAW (v18)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    Text("AI Locale Ibrida v19 (Disattiva all'avvio)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
                     Text(
-                        text = "Motore ONNX: ${state.localAiBackendStatus}",
+                        text = "Su 1x/3.5x: HDR Locale Full-Res 12MP + Pulizia Ombre + Nitidezza (~0.6s).\nSu Zoom 7x-120x: Rete Neurale SPAN 4x sul ritaglio ottico.",
                         fontSize = 11.sp,
                         color = Color(0xFF81C784)
                     )
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
 
-                    ToggleRow(
-                        title = "Fusione RAW-in-RAM → JPEG leggero",
-                        subtitle = "Fonde 4 RAW lineari in background prima dell'AI (salva SOLO un normale JPG leggero)",
-                        checked = state.rawInRamEnabled,
-                        onChange = { enabled ->
-                            state = state.copy(
-                                rawInRamEnabled = enabled,
-                                bannerMessage = if (enabled) "RAW-in-RAM → JPEG attivato" else "RAW-in-RAM disattivato"
-                            )
-                        }
-                    )
-
-                    HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    Text("Rete Neurale Offline (100% Locale · Gratis)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        LocalNeuralModel.entries.forEach { m ->
-                            FilterChip(
-                                selected = state.localNeuralModel == m,
-                                onClick = {
-                                    state = state.copy(localNeuralModel = m, bannerMessage = "Modello AI: ${m.shortName}")
-                                },
-                                label = { Text(if (m == LocalNeuralModel.CLEAR_REALITY_SPAN) "SPAN 4x (Consigliato)" else "Real-ESRGAN v3") }
-                            )
-                        }
-                    }
-                    Text(
-                        text = state.localNeuralModel.description,
-                        fontSize = 11.sp,
-                        color = Color.White.copy(alpha = 0.65f)
-                    )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Text("Intensità AI Neurale Locale", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
+                    Text("AI Locale (100% Offline · Gratis)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF4FC3F7))
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
                         listOf(
@@ -956,7 +913,10 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
-                    Text("Cloud Gratuito Opzionale (Token gratuito HF)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB39DDB))
+                    HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Text("AI in Cloud (Opzionale · Token gratuito HF)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFB39DDB))
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(UnifiedAiPreset.CLOUD_FREE_MED, UnifiedAiPreset.CLOUD_FREE_HIGH).forEach { preset ->
@@ -977,6 +937,22 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                             )
                         }
                     }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    ToggleRow(
+                        title = "Fusione RAW-in-RAM (Sperimentale)",
+                        subtitle = "Spenta di default per massima nitidezza AF; attivala solo su treppiede/soggetti fermi",
+                        checked = state.rawInRamEnabled,
+                        onChange = { enabled ->
+                            state = state.copy(
+                                rawInRamEnabled = enabled,
+                                bannerMessage = if (enabled) "RAW-in-RAM attivato" else "RAW-in-RAM disattivato"
+                            )
+                        }
+                    )
                     Spacer(modifier = Modifier.height(24.dp))
                 }
             }
@@ -1052,7 +1028,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // MESSA A FUOCO
+        // MESSA A FUOCO (Parte in Autofocus AF, mantiene scelta tra AF / Manuale / AI Lock)
         if (sheet == SheetPage.FOCUS) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -1060,7 +1036,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                 contentColor = Color.White
             ) {
                 Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)) {
-                    Text("Messa a fuoco", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    Text("Messa a fuoco (Automatica all'avvio)", fontSize = 15.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FocusMode.entries.forEach { fm ->
@@ -1084,7 +1060,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
             }
         }
 
-        // IMPOSTAZIONI FOTO, VIDEO & AI NEURALE v18
+        // IMPOSTAZIONI FOTO, VIDEO & AI v19
         if (sheet == SheetPage.SETTINGS) {
             ModalBottomSheet(
                 onDismissRequest = { sheet = SheetPage.NONE },
@@ -1097,9 +1073,9 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                         .verticalScroll(rememberScrollState())
                         .padding(horizontal = 20.dp, vertical = 12.dp)
                 ) {
-                    Text("Impostazioni Foto & AI Neurale (v18)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("Impostazioni Foto & AI (v19)", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Spacer(modifier = Modifier.height(4.dp))
-                    Text("AI Locale ONNX: ${state.localAiBackendStatus}", fontSize = 11.sp, color = Color(0xFFFFCA28))
+                    Text("AI Neurale Zoom (SPAN): ${state.localAiBackendStatus}", fontSize = 11.sp, color = Color(0xFFFFCA28))
                     Text("Estensioni HW: ${state.hwExtensionsReport}", fontSize = 11.sp, color = Color(0xFF81C784))
                     Text("Sensori: ${state.sensorCapabilitiesReport}", fontSize = 11.sp, color = Color(0xFF4FC3F7))
 
@@ -1107,40 +1083,24 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    Text("VERA AI NEURALE LOCALE (OFFLINE · GRATIS)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFFFCA28))
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        LocalNeuralModel.entries.forEach { m ->
-                            FilterChip(
-                                selected = state.localNeuralModel == m,
-                                onClick = { state = state.copy(localNeuralModel = m) },
-                                label = { Text(m.displayName, fontSize = 12.sp) }
-                            )
-                        }
-                    }
+                    Text("MOTORE AI LOCALE & BACKGROUND", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFFFCA28))
                     ToggleRow(
-                        title = "Accelerazione Hardware NPU/DSP (Android NNAPI)",
-                        subtitle = "Prova a delegare la rete neurale alla NPU Dimensity tramite NNAPI FP16 (con fallback automatico su CPU 4-Thread)",
+                        title = "Accelerazione Hardware NPU/DSP (NNAPI)",
+                        subtitle = "Usa NNAPI FP16 per SPAN 4x sugli zoom >= 7x (con fallback CPU 4-Thread)",
                         checked = state.preferNnapiNpu,
                         onChange = { state = state.copy(preferNnapiNpu = it) }
                     )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-                    HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    Text("MOTORE RAW & MULTI-FRAME IN BACKGROUND", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF4DB6AC))
                     ToggleRow(
-                        title = "Fusione RAW-in-RAM → JPEG leggero",
-                        subtitle = "Fonde 4 RAW grezzi su 1x e Tele 3.5x in spazio lineare e salva solo un normale JPG (zero DNG pesanti)",
-                        checked = state.rawInRamEnabled,
-                        onChange = { state = state.copy(rawInRamEnabled = it) }
-                    )
-                    ToggleRow(
-                        title = "Elaborazione in Background",
-                        subtitle = "Sblocca subito lo scatto mentre RAW e rete neurale completano la foto in coda",
+                        title = "Elaborazione AI in Background",
+                        subtitle = "Sblocca subito lo scatto mentre l'AI elabora la foto in coda separata",
                         checked = state.backgroundProcessingEnabled,
                         onChange = { state = state.copy(backgroundProcessingEnabled = it) }
+                    )
+                    ToggleRow(
+                        title = "Fusione RAW-in-RAM (Sperimentale)",
+                        subtitle = "Spenta di default; cattura 4 RAW in RAM e salva un JPG leggero",
+                        checked = state.rawInRamEnabled,
+                        onChange = { state = state.copy(rawInRamEnabled = it) }
                     )
 
                     Spacer(modifier = Modifier.height(10.dp))
@@ -1150,7 +1110,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     Text("ESTENSIONI HARDWARE (NOTTE / RITRATTO)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF81C784))
                     ToggleRow(
                         title = "Forza Camera Logica per Estensioni HW",
-                        subtitle = "Usa la camera logica Oppo per HW Notte e HW Bokeh",
+                        subtitle = "Usa la camera logica Oppo in modalità Notte e Ritratto",
                         checked = state.forceLogicalHwExtensions,
                         onChange = { state = state.copy(forceLogicalHwExtensions = it) }
                     )
@@ -1238,7 +1198,7 @@ fun FreshCameraScreen(lifecycleOwner: LifecycleOwner) {
                     HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    Text("CLOUD GRATUITO (OPZIONALE · ZERO ABBONAMENTI)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB39DDB))
+                    Text("CLOUD GRATUITO (DISATTIVO ALL'AVVIO · OPZIONALE)", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB39DDB))
                     Spacer(modifier = Modifier.height(6.dp))
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         FreeCloudPreset.entries.forEach { preset ->

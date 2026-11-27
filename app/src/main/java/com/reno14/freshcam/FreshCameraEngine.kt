@@ -78,12 +78,16 @@ class FreshCameraEngine(
     private var lastOnExtensionUpdate: ((String?, String) -> Unit)? = null
     private var lastOnBanner: ((String) -> Unit)? = null
 
+    // v19: Thread DEDICATO al salvataggio JPEG Diretto (mai bloccato da coda AI/RAW!)
+    private val directSaveExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "FreshCam-DirectSave")
+    }
     private val rawCaptureExecutor = Executors.newSingleThreadExecutor()
     private val backgroundProcessor = Executors.newSingleThreadExecutor { r ->
         Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
             r.run()
-        }, "FreshCam-BG-Neural")
+        }, "FreshCam-BG-AI")
     }
     private val pendingBgJobs = AtomicInteger(0)
 
@@ -119,10 +123,6 @@ class FreshCameraEngine(
         ExifInterface.TAG_APERTURE_VALUE,
         ExifInterface.TAG_SHUTTER_SPEED_VALUE
     )
-
-    fun probeLocalAiStatus(model: LocalNeuralModel, preferNnapi: Boolean): String {
-        return onnxEngine.probeRuntimeStatus(model, preferNnapi)
-    }
 
     fun discoverLenses(): List<PhysicalLensInfo> {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -275,7 +275,7 @@ class FreshCameraEngine(
     private fun pickDesiredExtensionMode(state: FreshCamState, extMgr: ExtensionsManager, targetSelector: CameraSelector): Pair<Int, String>? {
         if (state.shootingMode == ShootingMode.VIDEO) return null
         if (state.captureFormat != CaptureFormat.NORMAL) return null
-        if (!state.aiPreset.isEnabled && state.shootingMode == ShootingMode.PHOTO) return null
+        if (state.shootingMode == ShootingMode.PHOTO) return null
 
         val candidates: List<Pair<Int, String>> = when (state.shootingMode) {
             ShootingMode.NIGHT -> listOf(
@@ -288,10 +288,7 @@ class FreshCameraEngine(
                 ExtensionMode.HDR to "HW HDR",
                 ExtensionMode.AUTO to "HW Auto"
             )
-            else -> listOf(
-                ExtensionMode.HDR to "HW HDR",
-                ExtensionMode.AUTO to "HW Auto"
-            )
+            else -> emptyList()
         }
 
         for (pair in candidates) {
@@ -391,7 +388,7 @@ class FreshCameraEngine(
                     val previewExt = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
                     val capExtBuilder = ImageCapture.Builder()
                         .setJpegQuality(state.jpegQuality.coerceIn(85, 100))
-                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     applyFlashBuilder(capExtBuilder, state.flashMode)
                     val capExt = capExtBuilder.build()
 
@@ -412,33 +409,16 @@ class FreshCameraEngine(
                     .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
                     .build()
 
+                // v19: Scatto a bassa latenza per azzerare il mosso su 1x e 3.5x senza mandare in stallo l'ISP MediaTek
                 val captureBuilder = ImageCapture.Builder()
                     .setResolutionSelector(resSelector)
                     .setJpegQuality(state.jpegQuality.coerceIn(85, 100))
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
 
                 val pExt = Camera2Interop.Extender(previewBuilder)
                 val cExt = Camera2Interop.Extender(captureBuilder)
 
-                val nrMode = if (state.captureFormat == CaptureFormat.RAW) {
-                    CaptureRequest.NOISE_REDUCTION_MODE_FAST
-                } else {
-                    CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
-                }
-                val edgeMode = if (state.captureFormat == CaptureFormat.RAW) {
-                    CaptureRequest.EDGE_MODE_FAST
-                } else {
-                    CaptureRequest.EDGE_MODE_HIGH_QUALITY
-                }
-
-                pExt.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, nrMode)
-                pExt.setCaptureRequestOption(CaptureRequest.EDGE_MODE, edgeMode)
-                cExt.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, nrMode)
-                cExt.setCaptureRequestOption(CaptureRequest.EDGE_MODE, edgeMode)
-                cExt.setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
-                cExt.setCaptureRequestOption(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_HIGH_QUALITY)
-                cExt.setCaptureRequestOption(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_HIGH_QUALITY)
-
+                // v19: Manteniamo solo OIS ottico e AF/PRO puliti, senza forzare TONEMAP/SHADING/EDGE/NR che rallentano ID0
                 val oisMode = if (state.stabilizationEnabled) {
                     CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
                 } else {
@@ -506,7 +486,6 @@ class FreshCameraEngine(
                 val vExt = Camera2Interop.Extender(vBuilder)
                 vExt.setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, oisMode)
                 vExt.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, videoStabMode)
-                vExt.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
                 videoCapture = vBuilder.build()
 
                 provider.unbindAll()
@@ -740,7 +719,7 @@ class FreshCameraEngine(
                 ContextCompat.getMainExecutor(context).execute {
                     onBackgroundQueueChanged(queueSize)
                     if (!snapshot.backgroundProcessingEnabled) {
-                        onStatus("Fusione RAW + AI Neurale...")
+                        onStatus("Fusione RAW → JPEG...")
                     }
                 }
 
@@ -751,9 +730,9 @@ class FreshCameraEngine(
                         } else {
                             snapshot.displayZoom.coerceIn(1.0f, 3.45f)
                         }
-                        val useLocalNeural = snapshot.aiPreset.isEnabled && !snapshot.aiPreset.isCloud
+                        val useLocalAi = snapshot.aiPreset.isEnabled && !snapshot.aiPreset.isCloud
                         val useFreeCloud = snapshot.aiPreset.isEnabled && snapshot.aiPreset.isCloud
-                        val neuralZoomCrop = useLocalNeural && snapshot.displayZoom >= 6.5f && digitalZoom > 1.25f
+                        val neuralZoomCrop = useLocalAi && snapshot.displayZoom >= 6.5f && digitalZoom > 1.25f
 
                         val rawOutcome = rawEngine.processRawBurst(
                             payload = payload,
@@ -769,20 +748,17 @@ class FreshCameraEngine(
                         var finalBitmap = rawOutcome.bitmap
                         var finalLabel = rawOutcome.modeApplied
 
-                        if (useLocalNeural) {
-                            val aiRes = onnxEngine.enhancePhoto(
+                        if (useLocalAi && snapshot.displayZoom >= 6.5f) {
+                            val aiRes = onnxEngine.enhanceZoomedCrop(
                                 source = finalBitmap,
                                 model = snapshot.localNeuralModel,
                                 level = snapshot.aiPreset.level,
-                                displayZoom = snapshot.displayZoom,
                                 preferNnapi = snapshot.preferNnapiNpu
                             )
                             ContextCompat.getMainExecutor(context).execute {
-                                onBackendUpdate("Attivo · ${snapshot.localNeuralModel.shortName} (${aiRes.backendUsed})")
+                                onBackendUpdate("Attivo · SPAN (${aiRes.backendUsed})")
                             }
-                            if (aiRes.error != null) {
-                                finalLabel = "$finalLabel · AI ERR: ${aiRes.error}"
-                            } else {
+                            if (aiRes.error == null) {
                                 if (aiRes.bitmap !== finalBitmap && !finalBitmap.isRecycled) finalBitmap.recycle()
                                 finalBitmap = aiRes.bitmap
                                 finalLabel = "$finalLabel + ${aiRes.label}"
@@ -817,12 +793,12 @@ class FreshCameraEngine(
                             onResult(uri, msg)
                         }
                     } catch (t: Throwable) {
-                        Log.e("Reno14FreshCam", "Errore elaborazione RAW+AI in background", t)
+                        Log.e("Reno14FreshCam", "Errore elaborazione RAW in background", t)
                         val left = pendingBgJobs.decrementAndGet().coerceAtLeast(0)
                         ContextCompat.getMainExecutor(context).execute {
                             onBackgroundQueueChanged(left)
                             if (!snapshot.backgroundProcessingEnabled) onCaptureUnlocked()
-                            onResult(null, "Errore fusione RAW+AI: ${t.localizedMessage}")
+                            onResult(null, "Errore fusione RAW: ${t.localizedMessage}")
                         }
                     }
                 }
@@ -845,7 +821,6 @@ class FreshCameraEngine(
         }
 
         val capturedLocation = if (snapshot.locationTagEnabled) getLastKnownLocation() else null
-        val isTele = snapshot.activeLens == LensType.TELE_50MP || snapshot.displayZoom >= 3.45f
 
         val requestedRatio = if (snapshot.activeHardwareExtension != null && snapshot.forceLogicalHwExtensions) {
             snapshot.displayZoom
@@ -864,16 +839,14 @@ class FreshCameraEngine(
             !snapshot.postSavePolishEnabled &&
             digitalExtraZoom <= 1.03f
 
-        val needBurst = !isDirectPassthrough &&
-            snapshot.activeHardwareExtension == null &&
-            snapshot.aiPreset.isEnabled &&
-            snapshot.captureFormat != CaptureFormat.RAW &&
-            (isTele || snapshot.aiPreset.level >= 2)
-
+        // v19: Scatto singolo veloce per AI Bassa/Media (zero mosso, salvataggio rapido); 2 frame solo su AI Alta
         val burstCount = when {
-            !needBurst -> 1
-            snapshot.aiPreset.level >= 3 -> 3
-            else -> 2
+            isDirectPassthrough -> 1
+            snapshot.activeHardwareExtension != null -> 1
+            !snapshot.aiPreset.isEnabled || snapshot.aiPreset.isCloud -> 1
+            snapshot.captureFormat == CaptureFormat.RAW -> 1
+            snapshot.aiPreset.level >= 3 && snapshot.displayZoom < 6.5f -> 2
+            else -> 1
         }
         val maxSide = 4400
         val collectedFrames = mutableListOf<Bitmap>()
@@ -882,7 +855,7 @@ class FreshCameraEngine(
         if (snapshot.activeHardwareExtension != null) {
             onStatus("Scatto ${snapshot.activeHardwareExtension}...")
         } else if (burstCount > 1) {
-            onStatus("Acquisizione raffica ${burstCount}x...")
+            onStatus("Acquisizione Multi-Frame ${burstCount}x...")
         }
 
         fun captureNextFrame(remaining: Int) {
@@ -898,13 +871,12 @@ class FreshCameraEngine(
                                 val rawBytes = ByteArray(buf.remaining())
                                 buf.get(rawBytes)
                                 imageProxy.close()
-                                if (snapshot.backgroundProcessingEnabled) onCaptureUnlocked()
+                                onCaptureUnlocked()
                                 saveDirectJpegBytes(
                                     jpegBytes = rawBytes,
                                     rotationDegrees = deg,
                                     snapshot = snapshot,
                                     capturedLocation = capturedLocation,
-                                    onDoneUnlock = { if (!snapshot.backgroundProcessingEnabled) onCaptureUnlocked() },
                                     onResult = onResult
                                 )
                                 return
@@ -946,7 +918,7 @@ class FreshCameraEngine(
                             if (snapshot.backgroundProcessingEnabled) {
                                 onCaptureUnlocked()
                             } else {
-                                onStatus("Elaborazione AI Neurale...")
+                                onStatus("Elaborazione AI Locale...")
                             }
                             enqueueBackgroundBitmapBurst(
                                 frames = collectedFrames,
@@ -1042,7 +1014,7 @@ class FreshCameraEngine(
 
                 outcome.backendUsed?.let { be ->
                     ContextCompat.getMainExecutor(context).execute {
-                        onBackendUpdate("Attivo · ${snapshot.localNeuralModel.shortName} ($be)")
+                        onBackendUpdate("Attivo · SPAN ($be)")
                     }
                 }
 
@@ -1150,10 +1122,10 @@ class FreshCameraEngine(
         rotationDegrees: Int,
         snapshot: FreshCamState,
         capturedLocation: Location?,
-        onDoneUnlock: () -> Unit,
         onResult: (uriString: String?, message: String) -> Unit
     ) {
-        backgroundProcessor.execute {
+        // v19: Usa directSaveExecutor separato dalla coda AI -> salvataggio ISTANTANEO!
+        directSaveExecutor.execute {
             try {
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ITALY).format(Date())
                 val zoomTag = "${String.format(Locale.US, "%.1f", snapshot.displayZoom)}x"
@@ -1201,22 +1173,19 @@ class FreshCameraEngine(
                         Log.w("Reno14FreshCam", "Aggiornamento EXIF diretto parziale", e)
                     }
 
-                    val label = snapshot.activeHardwareExtension ?: "JPEG Diretto (EXIF Intatti)"
+                    val label = snapshot.activeHardwareExtension ?: "JPEG Diretto"
                     val gpsNote = if (capturedLocation != null) " · GPS" else ""
                     ContextCompat.getMainExecutor(context).execute {
-                        onDoneUnlock()
                         onResult(uri.toString(), "Salvata: $label$gpsNote")
                     }
                 } else {
                     ContextCompat.getMainExecutor(context).execute {
-                        onDoneUnlock()
                         onResult(null, "Errore salvataggio in Galleria")
                     }
                 }
             } catch (t: Throwable) {
                 Log.e("Reno14FreshCam", "Errore salvataggio diretto JPEG", t)
                 ContextCompat.getMainExecutor(context).execute {
-                    onDoneUnlock()
                     onResult(null, "Errore foto: ${t.localizedMessage}")
                 }
             }
